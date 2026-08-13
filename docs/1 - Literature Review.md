@@ -404,10 +404,10 @@ $$
   \hat P_{j,t} \Delta t \cdot \widehat{CI}_t
   $$
 
----
+<!-- ---
 
 ## Possible Positioning
 
 The thesis can be positioned as follows:
 
-> Carbon-aware scheduling extends energy-aware HPC scheduling by introducing the time-varying carbon intensity of the electricity grid into the objective function. Unlike approaches that estimate emissions using a constant average factor, the proposed model associates each job’s energy profile with a dynamic carbon-intensity time series. Execution time therefore becomes a decision variable. The PM100 dataset makes it possible to evaluate this model using real power profiles and to compare an oracle scheduler with a predictive version based on estimated duration, power, or energy.
+> Carbon-aware scheduling extends energy-aware HPC scheduling by introducing the time-varying carbon intensity of the electricity grid into the objective function. Unlike approaches that estimate emissions using a constant average factor, the proposed model associates each job’s energy profile with a dynamic carbon-intensity time series. Execution time therefore becomes a decision variable. The PM100 dataset makes it possible to evaluate this model using real power profiles and to compare an oracle scheduler with a predictive version based on estimated duration, power, or energy. -->
