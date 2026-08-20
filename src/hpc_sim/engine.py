@@ -14,8 +14,11 @@ class EventKind(Enum):
     """Everything that can make the simulation clock move.
 
     ``CARBON_INTENSITY_CHANGE`` is emitted only for a scheduler that opts in.
-    A carbon-blind policy such as FCFS never observes one, so it costs nothing
-    to leave the source wired up for the carbon-aware policies of later phases.
+    A carbon-blind policy such as FCFS never observes one, and the carbon-aware
+    oracle does not need one either: knowing the whole signal in advance, it
+    asks for a wakeup at exactly the instant it chose. The source stays wired up
+    for a policy whose view of the signal can change while a job waits, which is
+    what a forecast-driven one will be.
     """
 
     COMPLETION = "completion"
@@ -152,6 +155,18 @@ class Simulator:
     @property
     def cluster(self) -> Cluster:
         return self._cluster
+
+    @property
+    def running(self) -> tuple[tuple[Job, datetime], ...]:
+        """The jobs currently executing, paired with the instant they started.
+
+        A backfilling policy needs this to project when nodes come back: it
+        combines each entry with its own runtime estimate. The engine exposes
+        start times rather than end times on purpose, because the true end is
+        exactly the information a scheduler is not allowed to read.
+        """
+
+        return tuple(self._running.values())
 
     def _push(self, when: datetime, kind: EventKind, payload: object = None) -> None:
         heapq.heappush(self._events, (when, next(self._sequence), kind, payload))

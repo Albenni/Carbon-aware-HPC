@@ -3,25 +3,31 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from statistics import fmean, median
 import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from carbon_intensity import TimeSeriesCarbonIntensityProvider
+from carbon_intensity import CarbonIntensityProvider, TimeSeriesCarbonIntensityProvider
 from hpc_sim import (
     PM100_PARTITION_1_NODES,
+    CarbonAwareScheduler,
     Cluster,
+    EASYBackfillScheduler,
     FCFSScheduler,
+    PowerCappedEASYScheduler,
+    RuntimeEstimateSource,
     Scheduler,
     SimulationResult,
     Simulator,
     TraceReplayScheduler,
     account_schedule,
+    bounded_slowdown,
+    format_metrics,
+    schedule_metrics,
 )
 from hpc_sim.workload import load_jobs
 
@@ -35,10 +41,43 @@ DEFAULT_CARBON_CACHE = (
 )
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "simulations"
 
-SCHEDULERS: dict[str, type[Scheduler]] = {
-    "fcfs": FCFSScheduler,
-    "replay": TraceReplayScheduler,
-}
+SCHEDULER_NAMES = ("fcfs", "easy", "power-cap", "carbon", "replay")
+
+WATTS_PER_MEGAWATT = 1e6
+
+
+def build_scheduler(
+    arguments: argparse.Namespace,
+    provider: CarbonIntensityProvider,
+) -> Scheduler:
+    """Instantiate the requested policy from the command line arguments."""
+
+    estimate = RuntimeEstimateSource(arguments.runtime_estimate)
+    if arguments.scheduler == "fcfs":
+        return FCFSScheduler()
+    if arguments.scheduler == "replay":
+        return TraceReplayScheduler()
+    if arguments.scheduler == "easy":
+        return EASYBackfillScheduler(runtime_estimate=estimate)
+    if arguments.scheduler == "power-cap":
+        if arguments.power_cap_mw is None:
+            raise SystemExit("--power-cap-mw is required for the power-cap scheduler")
+        return PowerCappedEASYScheduler(
+            arguments.power_cap_mw * WATTS_PER_MEGAWATT,
+            runtime_estimate=estimate,
+        )
+    if arguments.scheduler == "carbon":
+        return CarbonAwareScheduler(
+            provider,
+            max_delay=timedelta(hours=arguments.max_delay_hours),
+            decision_granularity=(
+                timedelta(minutes=arguments.decision_granularity_minutes)
+                if arguments.decision_granularity_minutes is not None
+                else None
+            ),
+            runtime_estimate=estimate,
+        )
+    raise SystemExit(f"unknown scheduler {arguments.scheduler}")
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -57,9 +96,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scheduler",
-        choices=sorted(SCHEDULERS),
+        choices=SCHEDULER_NAMES,
         default="fcfs",
-        help="fcfs = strict first-come first-served; replay = the recorded schedule",
+        help=(
+            "fcfs = strict first-come first-served; easy = FCFS with EASY "
+            "backfilling; power-cap = EASY under an aggregate power budget; "
+            "carbon = EASY holding each job for its cleanest start within the "
+            "delay budget; replay = the recorded schedule"
+        ),
+    )
+    parser.add_argument(
+        "--runtime-estimate",
+        choices=tuple(source.value for source in RuntimeEstimateSource),
+        default=RuntimeEstimateSource.TIME_LIMIT.value,
+        help=(
+            "runtime a backfilling policy may plan with: time_limit = the "
+            "requested walltime (classic EASY); scheduling = the prediction "
+            "seamlessly provided by the scheduler (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--power-cap-mw",
+        type=float,
+        default=None,
+        help="aggregate power budget in MW, required by the power-cap scheduler",
+    )
+    parser.add_argument(
+        "--max-delay-hours",
+        type=float,
+        default=6.0,
+        help=(
+            "how long the carbon scheduler may hold a job past its release "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--decision-granularity-minutes",
+        type=float,
+        default=None,
+        help=(
+            "spacing of the candidate start times the carbon scheduler "
+            "considers (default: the carbon-intensity granularity)"
+        ),
     )
     parser.add_argument("--workload", type=Path, default=DEFAULT_WORKLOAD)
     parser.add_argument("--carbon-cache", type=Path, default=DEFAULT_CARBON_CACHE)
@@ -92,6 +170,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def display_path(path: Path) -> str:
+    """Shorten a path against the project root when it lies inside it."""
+
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
 def default_output_path(scheduler_name: str, job_count: int, nodes: int) -> Path:
     return DEFAULT_OUTPUT_DIR / (
         f"simulation_{scheduler_name}_{job_count}jobs_{nodes}nodes.parquet"
@@ -122,6 +210,7 @@ def write_records(result: SimulationResult, destination: Path) -> Path:
                 record.turnaround_seconds_from_submit for record in records
             ],
             "delay_vs_trace_s": [record.delay_vs_trace_seconds for record in records],
+            "bounded_slowdown": [bounded_slowdown(record) for record in records],
             "energy_kwh": [record.energy_kwh for record in records],
             "emissions_gco2e": [record.emissions_gco2e for record in records],
             "energy_kwh_average_model": [
@@ -138,41 +227,9 @@ def write_records(result: SimulationResult, destination: Path) -> Path:
 
 
 def print_summary(result: SimulationResult) -> None:
-    records = result.records
-    waits = sorted(record.waiting_seconds for record in records)
-    energy_kwh = sum(record.energy_kwh or 0.0 for record in records)
-    emissions_g = sum(record.emissions_gco2e or 0.0 for record in records)
-    average_model_g = sum(
-        record.emissions_gco2e_average_model or 0.0 for record in records
-    )
+    """Report every metric for the run, from the shared scorer."""
 
-    print(f"scheduler                {result.scheduler_name}")
-    print(f"jobs                     {len(records):,}")
-    print(f"cluster capacity         {result.total_nodes:,} nodes")
-    print(f"peak nodes in use        {result.peak_busy_nodes:,}")
-    print(f"schedule span            {result.schedule_start} -> {result.schedule_end}")
-    print(f"makespan                 {result.makespan_seconds / 86_400:.2f} days")
-    print(f"node utilisation         {result.utilisation:.1%}")
-    print()
-    print(f"waiting time mean        {fmean(waits):,.1f} s")
-    print(f"waiting time median      {median(waits):,.1f} s")
-    print(f"waiting time p99         {waits[int(len(waits) * 0.99)]:,.1f} s")
-    print(f"waiting time max         {waits[-1]:,.1f} s")
-
-    delays = [
-        record.delay_vs_trace_seconds
-        for record in records
-        if record.delay_vs_trace_seconds is not None
-    ]
-    if delays:
-        print(f"delay vs trace mean      {fmean(delays):,.1f} s")
-        print(f"delay vs trace max       {max(delays):,.1f} s")
-    print()
-    print(f"total energy             {energy_kwh / 1_000:,.2f} MWh")
-    print(f"total emissions          {emissions_g / 1e6:,.3f} tCO2e")
-    if emissions_g:
-        gap = (average_model_g - emissions_g) / emissions_g
-        print(f"average-power model      {average_model_g / 1e6:,.3f} tCO2e ({gap:+.2%})")
+    print(format_metrics(schedule_metrics(result)))
 
 
 def main() -> int:
@@ -185,12 +242,10 @@ def main() -> int:
         released_before=arguments.released_before,
         average_power_source=arguments.average_power_source,
     )
-    cluster = Cluster(arguments.nodes)
-    scheduler = SCHEDULERS[arguments.scheduler]()
-
-    result = Simulator(jobs, cluster, scheduler).run()
-
     provider = TimeSeriesCarbonIntensityProvider.load(arguments.carbon_cache)
+    scheduler = build_scheduler(arguments, provider)
+
+    result = Simulator(jobs, Cluster(arguments.nodes), scheduler).run()
     result = account_schedule(result, jobs, provider)
 
     print_summary(result)
@@ -203,7 +258,7 @@ def main() -> int:
         )
         written = write_records(result, destination)
         print()
-        print(f"records written          {written.relative_to(PROJECT_ROOT)}")
+        print(f"records written          {display_path(written)}")
 
     return 0
 

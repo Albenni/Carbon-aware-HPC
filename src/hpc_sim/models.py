@@ -147,6 +147,19 @@ class Job:
         return self.actual_duration_seconds
 
     @property
+    def scheduling_average_power_watts(self) -> float:
+        """Average power a scheduler is allowed to use when deciding.
+
+        The measured-profile mean is ground truth that only exists after the
+        run; it stands in here until a later addition supplies a prediction, exactly as
+        :attr:`scheduling_duration_seconds` does for duration.
+        """
+
+        if self.predicted_average_power_watts is not None:
+            return self.predicted_average_power_watts
+        return self.power.average_power_watts
+
+    @property
     def node_seconds(self) -> float:
         return self.nodes_required * self.actual_duration_seconds
 
