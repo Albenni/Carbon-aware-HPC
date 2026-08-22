@@ -164,7 +164,7 @@ the start time as a variable. The overlap-based formula is exact.
 
 #### Evaluation Model: Measured Power Profile
 
-To construct the perfect-information benchmark and evaluate the error of the
+To construct the perfect information benchmark and evaluate the error of the
 simple model, the PM100 profile measured every 20 seconds is used. Each sample
 becomes a $P_{j,m}$ value in the previous discrete formula. The final interval
 is shortened to match the exact duration of the job; if the missing tail is no longer than
@@ -305,14 +305,13 @@ optimization phase.
 ### 2.7 Oracle, Predictions, and Evaluation
 
 The following four configurations separate the sources of error. PM100 values
-are historical ground truth reused at the new simulated start time; they are not
-new measurements of the counterfactually shifted job.
+are historical ground truth reused at the new simulated start time.
 
 | Configuration                 | Information Available at Decision Time                                | Purpose                                                  |
 | ----------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------- |
-| Perfect-information benchmark | actual duration, actual PM100 profile, actual future carbon intensity | Measures the potential without prediction errors         |
-| Forecast-only error           | actual job data, carbon-intensity forecast                            | Isolates the effect of electricity-signal forecast error |
-| Job-model-only error          | predicted duration and power, actual future carbon intensity          | Isolates the effect of job predictions                   |
+| Perfect information benchmark | actual duration, actual PM100 profile, actual future carbon intensity | Measures the potential without prediction errors         |
+| Forecast only error           | actual job data, carbon-intensity forecast                            | Isolates the effect of electricity-signal forecast error |
+| Job model only error          | predicted duration and power, actual future carbon intensity          | Isolates the effect of job predictions                   |
 | Realistic scenario            | predicted duration and power, forecast available at decision time     | Evaluates the system that can actually be used online    |
 
 In the simulator, actual duration and completion determine when resources

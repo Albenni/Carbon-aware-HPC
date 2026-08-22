@@ -98,13 +98,18 @@ makes it explicit:
 
 PM100 users overshoot heavily — the median job runs for **2.5%** of its
 requested walltime — so classic reservations sit far in the future and suppress
-backfills that perfect information would allow. `tests/check_baselines.py`
-pins that difference on a three job example. `SCHEDULING` is the setting that
+backfills that perfect information would allow. `SCHEDULING` is the setting that
 puts the baselines on the same footing as the carbon-aware policies,
 which is what "the same information for every scheduler compared" requires.
 
 Power is read through the matching seam, `Job.scheduling_average_power_watts`,
 so no policy ever touches a measured profile.
+
+The submission-time models in `src/job_prediction/` populate both seams from a
+prediction only parquet artifact. The event engine still releases resources at
+the actual completion time, and accounting still integrates the measured power
+profile, so estimates influence decisions without replacing ground truth in the
+evaluation.
 
 ### Why the energy-aware baseline caps power
 
@@ -170,7 +175,7 @@ substituting predictions turns the oracle into the realistic scenario without
 touching the policy. Evaluation still integrates the measured profile, and
 `average_model_gap` reports the residual difference on every run.
 
-**It is a benchmark, not an upper bound.** The rule is greedy and per job: every
+The rule is greedy and per job: every
 job independently aims at the same clean interval, and the queueing that
 collectively creates is a cost the rule does not model. Perfect information
 bounds what _this_ policy can do, not what the offline problem admits — that
@@ -296,6 +301,12 @@ module that needs pyarrow.
 .venv/bin/python scripts/run_simulation.py --scheduler carbon --max-delay-hours 6 \
   --runtime-estimate scheduling
 
+# held-out jobs, predicted inputs for decisions, actual outcomes for scoring
+.venv/bin/python scripts/train_job_models.py
+.venv/bin/python scripts/run_simulation.py --scheduler carbon \
+  --workload data/processed/pm100_clean.parquet \
+  --job-predictions data/job_predictions/test_predictions.parquet
+
 # every baseline over one workload, side by side, into a CSV
 .venv/bin/python scripts/compare_baselines.py --limit 5000
 
@@ -307,6 +318,7 @@ module that needs pyarrow.
 .venv/bin/python tests/check_simulator.py
 .venv/bin/python tests/check_baselines.py
 .venv/bin/python tests/check_carbon_aware.py
+.venv/bin/python tests/check_job_prediction.py
 ```
 
 The full 157,062-job trace takes roughly fourteen minutes for the four-policy
@@ -375,9 +387,9 @@ thing it can do in this model.
 **The cap's mean waiting time _improves_, and the mean is lying.** Capping power
 blocks the head of the queue more often, and every block is a backfill opening
 for a short job. Broken down by job width, one-node jobs (120,113 of 157,062)
-wait 58 s instead of 87 s, while 65–256-node jobs wait 1,099 s instead of 520 s.
+wait 58s instead of 87s, while 65–256-node jobs wait 1,099s instead of 520s.
 The cap does not make the system faster; it moves delay off the many narrow jobs
-onto the few wide ones, and the unchanged 58,043 s maximum shows the worst-served
+onto the few wide ones, and the unchanged 58,043s maximum shows the worst-served
 job is no better off. This is exactly the failure mode the QoS distributions
 exist to catch, and the same one a carbon-aware policy will be tempted to
 produce.
@@ -406,8 +418,8 @@ Energy is 553.34 MWh in every row, as it must be.
 monotonically with the budget, which is the answer to "does carbon-aware
 scheduling do anything at all": it does, and 7.1% is four orders of magnitude
 above the difference between the carbon-blind baselines themselves. But the QoS side grows faster
-than the carbon side throughout: going from a one-hour budget to a
-twenty-four-hour one multiplies the saving by 17 and the mean waiting time by 39.
+than the carbon side throughout: going from a one hour budget to a
+twentyfour hour one multiplies the saving by 17 and the mean waiting time by 39.
 The interesting region of this frontier is its left end, not its right.
 
 **The grid signal, not the policy, sets the ceiling.** Over the cached IT-NO
