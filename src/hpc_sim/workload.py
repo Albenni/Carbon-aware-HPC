@@ -6,11 +6,12 @@ schedulers, and models stay on the standard library.
 
 from __future__ import annotations
 
+from collections.abc import Set
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from carbon_accounting import JobPowerProfile, measured_average_power
+from carbon_accounting import JobIdentifier, JobPowerProfile, measured_average_power
 
 from .models import Job
 
@@ -27,7 +28,7 @@ _COLUMNS = (
     "start_time",
     "run_time",
     "time_limit",
-    "num_nodes_alloc",
+    "num_nodes_req",
     "node_power_consumption",
     "node_power_mean_W",
 )
@@ -74,7 +75,10 @@ def _job_from_row(
         job_id=row["job_id"],  # type: ignore[arg-type]
         submit_time=row["submit_time"],  # type: ignore[arg-type]
         release_time=row["release_time"],  # type: ignore[arg-type]
-        nodes_required=int(row["num_nodes_alloc"]),  # type: ignore[arg-type]
+        # Requested nodes are known at submission. They equal allocated nodes
+        # for every retained PM100 job, but only this field respects the online
+        # information boundary used by the prediction models.
+        nodes_required=int(row["num_nodes_req"]),  # type: ignore[arg-type]
         actual_duration_seconds=duration_seconds,
         power=power,
         time_limit_seconds=time_limit_seconds,
@@ -90,16 +94,19 @@ def load_jobs(
     released_before: datetime | None = None,
     average_power_source: AveragePowerSource = "weighted",
     batch_size: int = 4096,
+    job_ids: Set[JobIdentifier] | None = None,
 ) -> tuple[Job, ...]:
     """Read a cleaned PM100 parquet table into simulator jobs.
 
-    Rows are read in file order, which the dataset preparation export already made
-    chronological by submission. ``limit`` therefore takes a contiguous prefix
-    rather than an arbitrary sample, keeping the arrival process intact.
+    Rows are read in file order. The committed debug table is chronological, so
+    ``limit`` takes its contiguous prefix; the full cleaned table is not sorted,
+    and experiments that need a temporal cohort should use ``job_ids`` from a
+    chronological split instead of combining that table with ``limit``.
 
     ``released_from`` / ``released_before`` select a half-open window on
     ``release_time``, so a run can target one month without materialising the
-    whole trace.
+    whole trace. ``job_ids`` restricts loading to a prediction artifact or any
+    other explicit cohort.
     """
 
     if average_power_source not in ("weighted", "stored"):
@@ -116,6 +123,8 @@ def load_jobs(
         columns = {name: batch[name].to_pylist() for name in _COLUMNS}
         for position in range(batch.num_rows):
             row = {name: values[position] for name, values in columns.items()}
+            if job_ids is not None and row["job_id"] not in job_ids:
+                continue
             release_time = row["release_time"]
             if released_from is not None and release_time < released_from:
                 continue

@@ -52,7 +52,14 @@ def build_scheduler(
 ) -> Scheduler:
     """Instantiate the requested policy from the command line arguments."""
 
-    estimate = RuntimeEstimateSource(arguments.runtime_estimate)
+    estimate_name = arguments.runtime_estimate
+    if estimate_name is None:
+        estimate_name = (
+            RuntimeEstimateSource.SCHEDULING.value
+            if arguments.job_predictions is not None
+            else RuntimeEstimateSource.TIME_LIMIT.value
+        )
+    estimate = RuntimeEstimateSource(estimate_name)
     if arguments.scheduler == "fcfs":
         return FCFSScheduler()
     if arguments.scheduler == "replay":
@@ -108,11 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runtime-estimate",
         choices=tuple(source.value for source in RuntimeEstimateSource),
-        default=RuntimeEstimateSource.TIME_LIMIT.value,
+        default=None,
         help=(
             "runtime a backfilling policy may plan with: time_limit = the "
             "requested walltime (classic EASY); scheduling = the prediction "
-            "seamlessly provided by the scheduler (default: %(default)s)"
+            "seam exposed by each job (default: scheduling with a prediction "
+            "file, otherwise time_limit)"
         ),
     )
     parser.add_argument(
@@ -140,6 +148,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--workload", type=Path, default=DEFAULT_WORKLOAD)
+    parser.add_argument(
+        "--job-predictions",
+        type=Path,
+        default=None,
+        help=(
+            "prediction parquet produced by train_job_models.py; its job ids "
+            "also select the workload cohort"
+        ),
+    )
     parser.add_argument("--carbon-cache", type=Path, default=DEFAULT_CARBON_CACHE)
     parser.add_argument(
         "--nodes",
@@ -235,13 +252,62 @@ def print_summary(result: SimulationResult) -> None:
 def main() -> int:
     arguments = build_parser().parse_args()
 
-    jobs = load_jobs(
-        arguments.workload,
-        limit=arguments.limit,
-        released_from=arguments.released_from,
-        released_before=arguments.released_before,
-        average_power_source=arguments.average_power_source,
+    if arguments.job_predictions is not None:
+        from job_prediction import attach_predictions, load_prediction_file
+
+    predictions = (
+        load_prediction_file(arguments.job_predictions)
+        if arguments.job_predictions is not None
+        else None
     )
+    if predictions is not None:
+        if arguments.limit is not None and arguments.limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        # Resolve the complete artifact cohort before applying optional debug
+        # filters. This catches a wrong workload instead of silently simulating
+        # the intersection, and makes --limit a chronological artifact prefix
+        # even though the full PM100 parquet itself is unsorted.
+        jobs = load_jobs(
+            arguments.workload,
+            average_power_source=arguments.average_power_source,
+            job_ids=set(predictions),
+        )
+        loaded_ids = {job.job_id for job in jobs}
+        missing_ids = set(predictions).difference(loaded_ids)
+        if missing_ids:
+            preview = ", ".join(
+                str(job_id) for job_id in sorted(missing_ids, key=str)[:5]
+            )
+            suffix = "..." if len(missing_ids) > 5 else ""
+            raise ValueError(
+                f"prediction artifact contains job ids absent from the workload: "
+                f"{preview}{suffix}"
+            )
+        artifact_order = {
+            job_id: position for position, job_id in enumerate(predictions)
+        }
+        jobs = tuple(sorted(jobs, key=lambda job: artifact_order[job.job_id]))
+        if arguments.released_from is not None:
+            jobs = tuple(
+                job for job in jobs if job.release_time >= arguments.released_from
+            )
+        if arguments.released_before is not None:
+            jobs = tuple(
+                job for job in jobs if job.release_time < arguments.released_before
+            )
+        if arguments.limit is not None:
+            jobs = jobs[: arguments.limit]
+        if not jobs:
+            raise ValueError("no predicted jobs matched the requested filters")
+        jobs = attach_predictions(jobs, predictions)
+    else:
+        jobs = load_jobs(
+            arguments.workload,
+            limit=arguments.limit,
+            released_from=arguments.released_from,
+            released_before=arguments.released_before,
+            average_power_source=arguments.average_power_source,
+        )
     provider = TimeSeriesCarbonIntensityProvider.load(arguments.carbon_cache)
     scheduler = build_scheduler(arguments, provider)
 
@@ -249,10 +315,17 @@ def main() -> int:
     result = account_schedule(result, jobs, provider)
 
     print_summary(result)
+    if arguments.job_predictions is not None:
+        print(f"job predictions          {display_path(arguments.job_predictions)}")
 
     if not arguments.no_output:
+        scheduler_label = (
+            f"{result.scheduler_name}-predicted"
+            if arguments.job_predictions is not None
+            else result.scheduler_name
+        )
         destination = arguments.output or default_output_path(
-            result.scheduler_name,
+            scheduler_label,
             len(result.records),
             result.total_nodes,
         )
