@@ -16,8 +16,10 @@ from hpc_sim import (
     PM100_PARTITION_1_NODES,
     CarbonAwareScheduler,
     Cluster,
+    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
     FCFSScheduler,
+    PowerCappedCarbonAwareScheduler,
     PowerCappedEASYScheduler,
     RuntimeEstimateSource,
     Scheduler,
@@ -41,7 +43,15 @@ DEFAULT_CARBON_CACHE = (
 )
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "simulations"
 
-SCHEDULER_NAMES = ("fcfs", "easy", "power-cap", "carbon", "replay")
+SCHEDULER_NAMES = (
+    "fcfs",
+    "easy",
+    "power-cap",
+    "carbon",
+    "carbon-scaled-delay",
+    "carbon-power-cap",
+    "replay",
+)
 
 WATTS_PER_MEGAWATT = 1e6
 
@@ -73,16 +83,32 @@ def build_scheduler(
             arguments.power_cap_mw * WATTS_PER_MEGAWATT,
             runtime_estimate=estimate,
         )
-    if arguments.scheduler == "carbon":
-        return CarbonAwareScheduler(
-            provider,
-            max_delay=timedelta(hours=arguments.max_delay_hours),
-            decision_granularity=(
+    if arguments.scheduler in {"carbon", "carbon-scaled-delay", "carbon-power-cap"}:
+        options = {
+            "decision_granularity": (
                 timedelta(minutes=arguments.decision_granularity_minutes)
                 if arguments.decision_granularity_minutes is not None
                 else None
             ),
-            runtime_estimate=estimate,
+            "runtime_estimate": estimate,
+        }
+        if arguments.scheduler == "carbon-scaled-delay":
+            return DurationScaledCarbonAwareScheduler(
+                provider,
+                max_delay_fraction=arguments.max_delay_fraction,
+                **options,
+            )
+        options["max_delay"] = timedelta(hours=arguments.max_delay_hours)
+        if arguments.scheduler == "carbon":
+            return CarbonAwareScheduler(provider, **options)
+        if arguments.power_cap_mw is None:
+            raise SystemExit(
+                "--power-cap-mw is required for the carbon-power-cap scheduler"
+            )
+        return PowerCappedCarbonAwareScheduler(
+            provider,
+            arguments.power_cap_mw * WATTS_PER_MEGAWATT,
+            **options,
         )
     raise SystemExit(f"unknown scheduler {arguments.scheduler}")
 
@@ -109,7 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
             "fcfs = strict first-come first-served; easy = FCFS with EASY "
             "backfilling; power-cap = EASY under an aggregate power budget; "
             "carbon = EASY holding each job for its cleanest start within the "
-            "delay budget; replay = the recorded schedule"
+            "fixed delay budget; carbon-scaled-delay = the same policy with a "
+            "per-job budget proportional to duration; carbon-power-cap = the "
+            "fixed-delay policy under the aggregate power budget; replay = the "
+            "recorded schedule"
         ),
     )
     parser.add_argument(
@@ -127,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--power-cap-mw",
         type=float,
         default=None,
-        help="aggregate power budget in MW, required by the power-cap scheduler",
+        help="aggregate power budget in MW, required by either capped scheduler",
     )
     parser.add_argument(
         "--max-delay-hours",
@@ -136,6 +165,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "how long the carbon scheduler may hold a job past its release "
             "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--max-delay-fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "maximum voluntary delay as a fraction of each job's scheduling "
+            "duration for carbon-scaled-delay (default: %(default)s)"
         ),
     )
     parser.add_argument(

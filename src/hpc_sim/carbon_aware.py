@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime, timedelta
+from math import isfinite
 from types import MappingProxyType
 
 from carbon_accounting import energy_from_constant_power
@@ -29,7 +30,7 @@ from carbon_intensity import (
 
 from .engine import PendingQueue, Simulator
 from .models import Job, seconds
-from .schedulers import EASYBackfillScheduler, RuntimeEstimateSource
+from .schedulers import EASYBackfillScheduler, RuntimeEstimateSource, _PowerCapMixin
 
 
 class CarbonSignal:
@@ -166,7 +167,68 @@ def cheapest_start_time(
     )
 
 
-class CarbonAwareScheduler(EASYBackfillScheduler):
+class _CarbonAwareScheduler(EASYBackfillScheduler):
+    """Target selection and queue handling shared by carbon-aware policies."""
+
+    def __init__(
+        self,
+        provider: CarbonIntensityProvider,
+        *,
+        decision_granularity: timedelta | None = None,
+        runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
+        backfill_window: int | None = None,
+    ) -> None:
+        super().__init__(
+            runtime_estimate=runtime_estimate,
+            backfill_window=backfill_window,
+        )
+        granularity = (
+            provider.granularity if decision_granularity is None else decision_granularity
+        )
+        if not isinstance(granularity, timedelta):
+            raise TypeError("decision_granularity must be a timedelta")
+        if granularity <= timedelta(0):
+            raise ValueError("decision_granularity must be greater than zero")
+
+        self._signal = CarbonSignal(provider)
+        self._granularity = granularity
+        self._targets: dict[object, datetime] = {}
+
+    @property
+    def target_start_times(self) -> Mapping[object, datetime]:
+        """Instant each job was held for, for validation and inspection."""
+
+        return MappingProxyType(self._targets)
+
+    def _max_delay_for(self, job: Job) -> timedelta:
+        raise NotImplementedError
+
+    def on_release(self, job: Job, now: datetime, simulator: Simulator) -> None:
+        target = (
+            job.release_time
+            if job.power is None
+            else cheapest_start_time(
+                job,
+                self._signal,
+                max_delay=self._max_delay_for(job),
+                granularity=self._granularity,
+            )
+        )
+        self._targets[job.job_id] = target
+        if target > now:
+            simulator.request_wakeup(target)
+
+    def _ready(
+        self,
+        queue: PendingQueue,
+        now: datetime,
+        simulator: Simulator,
+    ) -> Iterable[Job]:
+        del simulator
+        return (job for job in queue if self._targets[job.job_id] <= now)
+
+
+class CarbonAwareScheduler(_CarbonAwareScheduler):
     """EASY backfilling that holds each job for its cleanest start time.
 
     When a job becomes eligible the policy scores every candidate start in
@@ -208,57 +270,101 @@ class CarbonAwareScheduler(EASYBackfillScheduler):
         runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
         backfill_window: int | None = None,
     ) -> None:
-        super().__init__(
-            runtime_estimate=runtime_estimate,
-            backfill_window=backfill_window,
-        )
         if not isinstance(max_delay, timedelta):
             raise TypeError("max_delay must be a timedelta")
         if max_delay < timedelta(0):
             raise ValueError("max_delay cannot be negative")
-        granularity = (
-            provider.granularity if decision_granularity is None else decision_granularity
-        )
-        if not isinstance(granularity, timedelta):
-            raise TypeError("decision_granularity must be a timedelta")
-        if granularity <= timedelta(0):
-            raise ValueError("decision_granularity must be greater than zero")
-
-        self._signal = CarbonSignal(provider)
         self._max_delay = max_delay
-        self._granularity = granularity
-        self._targets: dict[object, datetime] = {}
+        super().__init__(
+            provider,
+            decision_granularity=decision_granularity,
+            runtime_estimate=runtime_estimate,
+            backfill_window=backfill_window,
+        )
 
     @property
     def max_delay(self) -> timedelta:
         return self._max_delay
 
-    @property
-    def target_start_times(self) -> Mapping[object, datetime]:
-        """Instant each job was held for, for validation and inspection."""
+    def _max_delay_for(self, job: Job) -> timedelta:
+        del job
+        return self._max_delay
 
-        return MappingProxyType(self._targets)
 
-    def on_release(self, job: Job, now: datetime, simulator: Simulator) -> None:
-        target = (
-            job.release_time
-            if job.power is None
-            else cheapest_start_time(
-                job,
-                self._signal,
-                max_delay=self._max_delay,
-                granularity=self._granularity,
-            )
-        )
-        self._targets[job.job_id] = target
-        if target > now:
-            simulator.request_wakeup(target)
+class DurationScaledCarbonAwareScheduler(_CarbonAwareScheduler):
+    """Carbon-aware EASY with a delay budget proportional to each job.
 
-    def _ready(
+    The per-job budget is ``scheduling_duration_seconds × max_delay_fraction``.
+    It therefore uses a duration prediction when present and never reads the
+    actual duration by accident. A fraction of ``1.0`` allows voluntary delay
+    up to 100% of the estimated runtime; zero reproduces EASY.
+    """
+
+    name = "carbon-scaled-delay"
+
+    def __init__(
         self,
-        queue: PendingQueue,
-        now: datetime,
-        simulator: Simulator,
-    ) -> Iterable[Job]:
-        del simulator
-        return (job for job in queue if self._targets[job.job_id] <= now)
+        provider: CarbonIntensityProvider,
+        *,
+        max_delay_fraction: float = 1.0,
+        decision_granularity: timedelta | None = None,
+        runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
+        backfill_window: int | None = None,
+    ) -> None:
+        if isinstance(max_delay_fraction, bool):
+            raise TypeError("max_delay_fraction must be a number, not a boolean")
+        try:
+            fraction = float(max_delay_fraction)
+        except (TypeError, ValueError) as error:
+            raise TypeError("max_delay_fraction must be a real number") from error
+        if not isfinite(fraction) or fraction < 0.0:
+            raise ValueError("max_delay_fraction must be finite and non-negative")
+        self._max_delay_fraction = fraction
+        super().__init__(
+            provider,
+            decision_granularity=decision_granularity,
+            runtime_estimate=runtime_estimate,
+            backfill_window=backfill_window,
+        )
+
+    @property
+    def max_delay_fraction(self) -> float:
+        return self._max_delay_fraction
+
+    def _max_delay_for(self, job: Job) -> timedelta:
+        try:
+            return seconds(job.scheduling_duration_seconds * self._max_delay_fraction)
+        except OverflowError as error:
+            raise ValueError(f"scaled delay for job {job.job_id} is too large") from error
+
+
+class PowerCappedCarbonAwareScheduler(_PowerCapMixin, CarbonAwareScheduler):
+    """Carbon-aware EASY constrained by an aggregate power budget.
+
+    Jobs are held for the same carbon target as in :class:`CarbonAwareScheduler`.
+    Once ready, they start only when both nodes and power headroom are available;
+    EASY reservations protect a pivot on both resources. With ``max_delay=0``
+    and the same runtime estimate this is exactly
+    :class:`~hpc_sim.schedulers.PowerCappedEASYScheduler`.
+    """
+
+    name = "carbon-power-cap"
+
+    def __init__(
+        self,
+        provider: CarbonIntensityProvider,
+        power_cap_watts: float,
+        *,
+        max_delay: timedelta,
+        decision_granularity: timedelta | None = None,
+        runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
+        backfill_window: int | None = None,
+    ) -> None:
+        self._set_power_cap(power_cap_watts)
+        super().__init__(
+            provider,
+            max_delay=max_delay,
+            decision_granularity=decision_granularity,
+            runtime_estimate=runtime_estimate,
+            backfill_window=backfill_window,
+        )

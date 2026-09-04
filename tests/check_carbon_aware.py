@@ -12,6 +12,7 @@ holding a job moves emissions without moving energy.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
@@ -31,9 +32,12 @@ from hpc_sim import (
     CarbonAwareScheduler,
     CarbonSignal,
     Cluster,
+    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
     FCFSScheduler,
     Job,
+    PowerCappedCarbonAwareScheduler,
+    PowerCappedEASYScheduler,
     RuntimeEstimateSource,
     Simulator,
     account_schedule,
@@ -208,6 +212,60 @@ class CarbonAwareSchedulerTest(unittest.TestCase):
         easy = run(jobs, EASYBackfillScheduler(runtime_estimate=EXACT))
         carbon = run(jobs, CarbonAwareScheduler(provider(), max_delay=timedelta(0)))
         self.assertEqual(start_times(easy), start_times(carbon))
+        scaled = run(
+            jobs, DurationScaledCarbonAwareScheduler(provider(), max_delay_fraction=0)
+        )
+        self.assertEqual(start_times(easy), start_times(scaled))
+
+        capped = run(jobs, PowerCappedEASYScheduler(3_000, runtime_estimate=EXACT))
+        combined = run(
+            jobs,
+            PowerCappedCarbonAwareScheduler(
+                provider(), 3_000, max_delay=timedelta(0), runtime_estimate=EXACT
+            ),
+        )
+        self.assertEqual(start_times(capped), start_times(combined))
+
+    def test_scaled_delay_uses_the_duration_available_to_the_scheduler(self) -> None:
+        actual = make_job("actual", duration_seconds=900)
+        predicted = replace(
+            make_job("predicted", duration_seconds=900),
+            predicted_duration_seconds=7_200,
+        )
+        targets = {}
+        for job in (actual, predicted):
+            scheduler = DurationScaledCarbonAwareScheduler(
+                provider(), max_delay_fraction=1.0
+            )
+            run((job,), scheduler)
+            targets[job.job_id] = scheduler.target_start_times[job.job_id]
+
+        self.assertEqual(targets, {"actual": BASE, "predicted": CLEAN_FROM})
+
+    def test_the_power_cap_limits_convergence_on_the_clean_bucket(self) -> None:
+        source = TimeSeriesCarbonIntensityProvider(
+            [
+                CarbonIntensitySample(BASE + index * QUARTER, CLEAN if index == 8 else DIRTY)
+                for index in range(96)
+            ]
+        )
+        jobs = [make_job(index, duration_seconds=900) for index in range(4)]
+        schedulers = (
+            EASYBackfillScheduler(runtime_estimate=EXACT),
+            PowerCappedEASYScheduler(2_000, runtime_estimate=EXACT),
+            CarbonAwareScheduler(source, max_delay=timedelta(hours=2)),
+            PowerCappedCarbonAwareScheduler(source, 2_000, max_delay=timedelta(hours=2)),
+        )
+        metrics = [schedule_metrics(run(jobs, scheduler, source=source)) for scheduler in schedulers]
+
+        self.assertEqual([item.total_emissions_gco2e for item in metrics], [400, 400, 100, 250])
+        self.assertEqual([item.peak_power_watts for item in metrics], [4_000, 2_000, 4_000, 2_000])
+        self.assertEqual([item.waiting.mean for item in metrics], [0, 450, 7_200, 7_650])
+        self.assertEqual(
+            (metrics[3].total_emissions_gco2e - metrics[2].total_emissions_gco2e)
+            / (metrics[0].total_emissions_gco2e - metrics[2].total_emissions_gco2e),
+            0.5,
+        )
 
     def test_holding_a_job_cuts_emissions_and_leaves_energy_untouched(self) -> None:
         jobs = [make_job(index, release_seconds=index * 60) for index in range(3)]

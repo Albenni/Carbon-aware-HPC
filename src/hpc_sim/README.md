@@ -75,6 +75,10 @@ class Scheduler(ABC):
   energy.
 - **`CarbonAwareScheduler`** is EASY plus one carbon decision per job: hold it
   until the cleanest start time within its delay budget. See below.
+- **`DurationScaledCarbonAwareScheduler`** gives each job a delay budget
+  proportional to the duration available to the scheduler.
+- **`PowerCappedCarbonAwareScheduler`** makes the same carbon decision, then
+  admits ready jobs only while aggregate scheduled power remains under the cap.
 - **`TraceReplayScheduler`** starts each job at its recorded `start_time`. It is
   the validation policy rather than a policy under study — see below.
 
@@ -122,11 +126,11 @@ What a power-aware policy can change is _when_ power is drawn. The baseline is
 the one a capped machine actually runs: never let the summed average power of
 the running jobs exceed `power_cap_watts`. It moves jobs in time for a power
 reason while staying blind to the grid signal — the precise contrast with a
-carbon-aware policy, which moves them for the opposite reason. The cap
-constrains starting decisions only; the pivot's reservation is still computed
-on nodes alone, so it stays a lower bound on when the pivot can really start. A
-job whose own average power exceeds the cap could never start, so it is
-rejected at release rather than left to stall the queue.
+carbon-aware policy, which moves them for the opposite reason. The cap applies
+to both starting decisions and EASY reservations, so a pivot waiting for power
+headroom cannot be starved by later backfills. A job whose own average power
+exceeds the cap could never start, so it is rejected at release rather than
+left to stall the queue.
 
 ### Carbon-aware scheduling with perfect information
 
@@ -185,6 +189,57 @@ job independently aims at the same clean interval, and the queueing that
 collectively creates is a cost the rule does not model. Perfect information
 bounds what _this_ policy can do, not what the offline problem admits — that
 belongs to the later optimisation formulation (§2.7).
+
+### Duration-scaled carbon delay
+
+`DurationScaledCarbonAwareScheduler` replaces the single wall-clock budget
+with `scheduling_duration_seconds × max_delay_fraction`. A factor of `1.0`
+means that a job may voluntarily wait up to 100% of its predicted runtime;
+without a prediction, the actual duration remains the existing
+perfect-information fallback. A factor of zero reproduces EASY.
+
+The scheduler uses the same candidate grid and carbon-cost function as the
+fixed-delay policy. Consequently, a job whose budget does not reach the next
+grid boundary stays at release: no finer start is invented than the signal can
+resolve. This naturally protects short jobs, while longer jobs retain enough
+flexibility to reach cleaner intervals.
+
+### Carbon-aware scheduling under a power cap
+
+`PowerCappedCarbonAwareScheduler` composes the two existing decisions without
+changing the event engine: a job first waits for the target selected from the
+carbon signal, then EASY admits it only when both nodes and aggregate power are
+available. Its reservations account for both resources. With `max_delay=0` it
+reproduces `PowerCappedEASYScheduler` start for start when both use the same
+runtime estimate.
+
+The cap uses `Job.scheduling_average_power_watts`, because only the scheduling
+estimate is available at decision time. Consequently, a run using predicted
+power can respect the planned cap while exceeding it in the ex-post metric if
+the model underpredicts; with actual job inputs the two coincide. As with the
+power-capped baseline, a resource-only job with no power estimate is rejected.
+
+On the 5,000-job debug workload, with exact scheduling inputs, the fixed
+variants use a six-hour budget, the scaled scheduler uses a factor of `1.0`, and
+the cap is 80% of FCFS's peak:
+
+| Scheduler          | Emissions (tCO2e) | Peak (MW) | Mean wait (s) | Wait p95 (s) | Mean slowdown |
+| ------------------ | -----------------: | --------: | ------------: | -----------: | ------------: |
+| EASY               |             4.6411 |     0.606 |          31.2 |          344 |          1.08 |
+| Power-capped EASY  |             4.6412 |     0.485 |          36.4 |          376 |          1.10 |
+| Carbon-aware       |             4.4245 |     0.586 |       6,391.4 |       20,353 |        225.70 |
+| Carbon + power cap |             4.4250 |     0.485 |       6,420.3 |       20,370 |        225.76 |
+| Duration-scaled    |             4.3962 |     0.593 |         257.0 |          444 |          1.14 |
+
+The cap reduces the carbon scheduler's peak by 17.2% while retaining 99.7744%
+of its saving against EASY: 0.2256% of the available saving is lost on this
+workload and configuration.
+
+The scaled budget saves 5.28% against EASY, compared with 4.67% for the fixed
+six-hour budget, while reducing mean waiting from 6,391 to 257 seconds. Its
+maximum wait is 73,972 seconds because long jobs receive a correspondingly long
+budget; bounded slowdown remains much smaller (mean 1.14, maximum 8.53), which
+is the QoS normalization this policy is meant to provide.
 
 ## Per-job records
 
@@ -289,7 +344,9 @@ from datetime import timedelta
 
 from hpc_sim import (
     CarbonAwareScheduler,
+    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
+    PowerCappedCarbonAwareScheduler,
     PowerCappedEASYScheduler,
     RuntimeEstimateSource,
 )
@@ -298,6 +355,12 @@ EASYBackfillScheduler()                                       # classic, plans o
 EASYBackfillScheduler(runtime_estimate=RuntimeEstimateSource.SCHEDULING)  # perfect information
 PowerCappedEASYScheduler(power_cap_watts=680_000.0)           # energy-aware baseline
 CarbonAwareScheduler(provider, max_delay=timedelta(hours=6))  # carbon-aware oracle
+DurationScaledCarbonAwareScheduler(                          # delay = predicted duration
+    provider, max_delay_fraction=1.0
+)
+PowerCappedCarbonAwareScheduler(                              # carbon plus the same cap
+    provider, 680_000.0, max_delay=timedelta(hours=6)
+)
 ```
 
 `hpc_sim` itself is standard-library only; `hpc_sim.workload` is the single
@@ -310,6 +373,10 @@ module that needs pyarrow.
 .venv/bin/python scripts/run_simulation.py --scheduler power-cap --power-cap-mw 0.68
 .venv/bin/python scripts/run_simulation.py --scheduler carbon --max-delay-hours 6 \
   --runtime-estimate scheduling
+.venv/bin/python scripts/run_simulation.py --scheduler carbon-scaled-delay \
+  --max-delay-fraction 1 --runtime-estimate scheduling
+.venv/bin/python scripts/run_simulation.py --scheduler carbon-power-cap \
+  --power-cap-mw 0.485 --max-delay-hours 6 --runtime-estimate scheduling
 
 # held-out jobs, predicted inputs for decisions, actual outcomes for scoring
 .venv/bin/python scripts/train_job_models.py
@@ -319,6 +386,11 @@ module that needs pyarrow.
 
 # every baseline over one workload, side by side, into a CSV
 .venv/bin/python scripts/compare_baselines.py --limit 5000
+
+# Add fixed-delay, capped and duration-scaled carbon-aware policies
+.venv/bin/python scripts/compare_baselines.py --limit 5000 --no-replay \
+  --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1 \
+  --power-cap-fraction 0.8
 
 # the carbon / QoS frontier: one run per delay budget, EASY as the reference
 .venv/bin/python scripts/carbon_tradeoff.py --limit 5000
@@ -373,7 +445,11 @@ its placements (`tests/check_carbon_aware.py`): the predicted cost of a start
 time agrees with `carbon_accounting` to nine decimals, no job on the PM100
 subset is ever held past its budget or started before its target, a zero budget
 reproduces EASY start time for start time, and holding jobs changes emissions
-while leaving energy identical.
+while leaving energy identical. The combined policy is also checked against all
+four expected carbon, peak-power and QoS outcomes on a synthetic clean bucket;
+at zero delay it reproduces power-capped EASY exactly. The duration-scaled
+check verifies that its budget follows the predicted duration when one exists,
+and a zero factor reproduces EASY.
 
 ## Baseline results
 
@@ -454,8 +530,8 @@ of the scheduler when it is mostly a property of the zone.
 **Peak power goes up, not down** — 0.852 to 0.903 MW at the widest budget. The
 greedy rule optimises each job in isolation and every job aims at the same clean
 interval, so the policy manufactures exactly the concentration the power-capped
-baseline exists to prevent. Combining the two is the obvious next experiment,
-and the reason the cap was built as a composable variant of EASY.
+baseline exists to prevent. The combined policy above now measures how much of
+that concentration can be removed and how much carbon saving it costs.
 
 **And the means understate the damage**, in the same way they did for the power
 cap. At a six-hour budget the mean bounded slowdown is 288 while the p95 is

@@ -139,6 +139,57 @@ that every artifact id exists in the workload, then applies optional release
 filters or a chronological `--limit`; a wrong or partial workload cannot be
 silently treated as the intended test cohort.
 
+## Scheduling impact on the held-out cohort
+
+The scheduling-impact command compares the same 23,560 test jobs in three
+configurations: EASY with actual job values, carbon-aware scheduling with
+actual duration and power, and carbon-aware scheduling with the persisted
+predictions. All runs use 880 nodes, a six-hour maximum carbon delay, the
+15-minute grid, actual runtimes for completion, and measured power profiles for
+ex-post accounting:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m job_prediction.scheduling_impact
+```
+
+| Configuration          | Emissions (tCO2e) | Saved vs EASY | Waiting mean (s) | Bounded slowdown mean |
+| ---------------------- | -----------------: | ------------: | ---------------: | --------------------: |
+| EASY, actual jobs      |            17.4712 |         0.00% |            422.9 |                  2.11 |
+| Carbon, actual jobs    |            17.2402 |         1.32% |          7,870.7 |                459.98 |
+| Carbon, predicted jobs |            17.4595 |         0.07% |          7,663.0 |                463.76 |
+
+Predictions therefore retain 5.05% of the carbon saving available with actual
+job values. Relative to that actual-value carbon schedule, emissions increase
+by 1.27%, mean waiting decreases by 2.64%, and mean bounded slowdown increases
+by 0.82%. The loss is material because almost all of the available carbon
+benefit disappears while the voluntary delay remains.
+
+The predicted target changes for 1,679 jobs (7.13%), and contention propagates
+those differences to 9,534 simulated starts (40.47%). The absolute start-time
+difference is 889.6 seconds on average, zero at the median, 5,614 seconds at
+p95, and 27,213 seconds at the maximum. Large relative duration errors are
+concentrated in very short jobs, but long jobs drive the direct carbon choice:
+59.66% of jobs lasting at least one hour receive a different target, compared
+with 0.32% of jobs shorter than ten seconds.
+
+Average power does not affect the choice in the current policy: it multiplies
+every candidate cost for a job by the same positive value and is not a resource
+constraint. The command verifies this with a counterfactual run using predicted
+duration and actual power; every target and simulated start is identical to the
+fully predicted run. A power model will matter once power is part of a cap or a
+multi-objective policy.
+
+The command writes three reproducible artifacts beside the model outputs:
+
+- `scheduling_impact_metrics.csv`: aggregate scheduler and QoS metrics;
+- `scheduling_impact_jobs.parquet`: prediction errors, targets, simulated
+  starts, waiting, slowdown, and emissions for every job;
+- `scheduling_impact_duration_bands.csv`: duration-error and start-change
+  summaries by actual runtime.
+
+These results justify improving the duration model next; they do not justify
+adding complexity to the power model for this scheduler.
+
 Run the short deterministic checks with:
 
 ```bash

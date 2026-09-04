@@ -28,6 +28,7 @@ from job_prediction import (
     fit_job_predictor,
     temporal_split,
 )
+from job_prediction.scheduling_impact import duration_band_table, impact_summary
 
 
 UTC = timezone.utc
@@ -63,6 +64,24 @@ def model_frame(count: int = 30) -> pd.DataFrame:
 
 
 class JobPredictionTest(unittest.TestCase):
+    def test_scheduling_impact_summarises_job_level_changes(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "actual_duration_s": [2.0, 30.0, 3_600.0],
+                "duration_absolute_relative_error": [100.0, 1.0, 0.1],
+                "power_absolute_relative_error": [0.3, 0.2, 0.1],
+                "target_start_delta_s": [900.0, 0.0, -900.0],
+                "absolute_target_start_delta_s": [900.0, 0.0, 900.0],
+                "simulated_start_delta_s": [1_800.0, 0.0, -900.0],
+                "absolute_simulated_start_delta_s": [1_800.0, 0.0, 900.0],
+            }
+        )
+
+        summary = impact_summary(frame)
+        self.assertEqual(summary["changed_start_jobs"], 2)
+        self.assertEqual(summary["absolute_start_delta_median_s"], 900.0)
+        self.assertEqual(duration_band_table(frame).jobs.tolist(), [1, 1, 1])
+
     def test_temporal_split_sorts_and_keeps_timestamp_ties_together(self) -> None:
         timestamps = [2, 1, 4, 1, 3, 0]
         data = pd.DataFrame(

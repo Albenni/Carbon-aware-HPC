@@ -1,17 +1,19 @@
-"""Run every baseline over one workload and tabulate the differences.
+"""Run comparable scheduling policies over one workload and tabulate the differences.
 
 The point of the comparison is that all policies see the same jobs, the same
 cluster, and the same runtime information, so a difference in the table is a
 difference in the policy and nothing else. The historical replay is included
 for reference only: its waiting times were produced under contention with jobs
 the dataset preparation removed, so it is a fidelity anchor rather than a
-performance baseline (see ``src/hpc_sim/README.md``).
+performance baseline (see ``src/hpc_sim/README.md``). Optional delay arguments
+add the fixed, power-capped and duration-scaled carbon-aware policies.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+from datetime import timedelta
 from pathlib import Path
 import sys
 
@@ -22,9 +24,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from carbon_intensity import TimeSeriesCarbonIntensityProvider
 from hpc_sim import (
     PM100_PARTITION_1_NODES,
+    CarbonAwareScheduler,
     Cluster,
+    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
     FCFSScheduler,
+    PowerCappedCarbonAwareScheduler,
     PowerCappedEASYScheduler,
     RuntimeEstimateSource,
     ScheduleMetrics,
@@ -106,6 +111,30 @@ def build_parser() -> argparse.ArgumentParser:
             "binds regardless of workload size (default: %(default)s)"
         ),
     )
+    parser.add_argument(
+        "--max-delay-hours",
+        type=float,
+        default=None,
+        help=(
+            "also compare carbon-aware scheduling, with and without the same "
+            "power cap, using this delay budget"
+        ),
+    )
+    parser.add_argument(
+        "--decision-granularity-minutes",
+        type=float,
+        default=None,
+        help="candidate spacing for carbon-aware schedulers",
+    )
+    parser.add_argument(
+        "--max-delay-fraction",
+        type=float,
+        default=None,
+        help=(
+            "also compare carbon-aware scheduling with a per-job delay budget "
+            "equal to this fraction of scheduling duration"
+        ),
+    )
     parser.add_argument("--no-replay", action="store_true", help="skip the trace replay")
     parser.add_argument(
         "--output",
@@ -138,18 +167,65 @@ def main() -> int:
         scored.append(score(TraceReplayScheduler()))
     fcfs = score(FCFSScheduler())
     scored.append(fcfs)
-    scored.append(score(EASYBackfillScheduler(runtime_estimate=estimate)))
+    easy = score(EASYBackfillScheduler(runtime_estimate=estimate))
+    scored.append(easy)
 
-    # The cap is expressed relative to the FCFS peak so that it binds on any
-    # workload slice; an absolute value stays available for a sensitivity sweep.
-    cap_watts = (
-        arguments.power_cap_mw * WATTS_PER_MEGAWATT
-        if arguments.power_cap_mw is not None
-        else arguments.power_cap_fraction * fcfs.peak_power_watts
+    # A relative cap cannot be lower than the largest job: that would make the
+    # workload unschedulable instead of merely limiting concurrent power.
+    if arguments.power_cap_mw is not None:
+        cap_watts = arguments.power_cap_mw * WATTS_PER_MEGAWATT
+    else:
+        relative_cap_watts = arguments.power_cap_fraction * fcfs.peak_power_watts
+        if relative_cap_watts <= 0.0:
+            raise ValueError("--power-cap-fraction must be greater than zero")
+        cap_watts = max(
+            relative_cap_watts,
+            max(job.scheduling_average_power_watts for job in jobs),
+        )
+    power_capped_easy = score(
+        PowerCappedEASYScheduler(cap_watts, runtime_estimate=estimate)
     )
-    scored.append(
-        score(PowerCappedEASYScheduler(cap_watts, runtime_estimate=estimate))
+    scored.append(power_capped_easy)
+
+    decision_granularity = (
+        timedelta(minutes=arguments.decision_granularity_minutes)
+        if arguments.decision_granularity_minutes is not None
+        else None
     )
+    carbon_saving_lost: float | None = None
+    if arguments.max_delay_hours is not None:
+        carbon_options = {
+            "max_delay": timedelta(hours=arguments.max_delay_hours),
+            "decision_granularity": decision_granularity,
+            "runtime_estimate": estimate,
+        }
+        carbon = score(CarbonAwareScheduler(provider, **carbon_options))
+        carbon_power_capped = score(
+            PowerCappedCarbonAwareScheduler(
+                provider,
+                cap_watts,
+                **carbon_options,
+            )
+        )
+        scored.extend((carbon, carbon_power_capped))
+        available_saving = easy.total_emissions_gco2e - carbon.total_emissions_gco2e
+        if available_saving > 0.0:
+            carbon_saving_lost = (
+                carbon_power_capped.total_emissions_gco2e
+                - carbon.total_emissions_gco2e
+            ) / available_saving
+
+    if arguments.max_delay_fraction is not None:
+        scored.append(
+            score(
+                DurationScaledCarbonAwareScheduler(
+                    provider,
+                    max_delay_fraction=arguments.max_delay_fraction,
+                    decision_granularity=decision_granularity,
+                    runtime_estimate=estimate,
+                )
+            )
+        )
 
     print(f"workload                 {arguments.workload.name}")
     print(f"jobs                     {fcfs.job_count:,}")
@@ -171,15 +247,60 @@ def main() -> int:
         )
         print(label.ljust(width) + cells)
 
+    if arguments.max_delay_hours is not None:
+        print()
+        if carbon_saving_lost is None:
+            print("carbon saving lost to cap  n/a (carbon-aware did not beat EASY)")
+        else:
+            print(f"carbon saving lost to cap  {carbon_saving_lost:.4%}")
+
     if arguments.no_output:
         return 0
 
-    destination = arguments.output or (
-        DEFAULT_OUTPUT_DIR
-        / f"baseline_comparison_{fcfs.job_count}jobs_{arguments.nodes}nodes.csv"
+    compares_carbon = (
+        arguments.max_delay_hours is not None
+        or arguments.max_delay_fraction is not None
+    )
+    comparison = "policy" if compares_carbon else "baseline"
+    destination = arguments.output or DEFAULT_OUTPUT_DIR / (
+        f"{comparison}_comparison_{fcfs.job_count}jobs_{arguments.nodes}nodes.csv"
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     rows = [metrics.as_row() for metrics in scored]
+    for metrics, row in zip(scored, rows):
+        capped = metrics.scheduler_name in {"power-cap", "carbon-power-cap"}
+        fixed_delay = metrics.scheduler_name in {"carbon-aware", "carbon-power-cap"}
+        scaled_delay = metrics.scheduler_name == "carbon-scaled-delay"
+        carbon_aware = fixed_delay or scaled_delay
+        row["power_cap_mw"] = cap_watts / WATTS_PER_MEGAWATT if capped else None
+        row["emissions_saved_vs_easy"] = (
+            (easy.total_emissions_gco2e - metrics.total_emissions_gco2e)
+            / easy.total_emissions_gco2e
+            if easy.total_emissions_gco2e
+            else 0.0
+        )
+        if compares_carbon:
+            row["max_delay_hours"] = (
+                arguments.max_delay_hours if fixed_delay else None
+            )
+            row["max_delay_fraction"] = (
+                arguments.max_delay_fraction if scaled_delay else None
+            )
+            row["decision_granularity_minutes"] = (
+                (
+                    arguments.decision_granularity_minutes
+                    if arguments.decision_granularity_minutes is not None
+                    else provider.granularity.total_seconds() / 60.0
+                )
+                if carbon_aware
+                else None
+            )
+            if arguments.max_delay_hours is not None:
+                row["carbon_saving_loss_fraction"] = (
+                    carbon_saving_lost
+                    if metrics.scheduler_name == "carbon-power-cap"
+                    else None
+                )
     fields: list[str] = []
     for row in rows:
         fields.extend(key for key in row if key not in fields)
