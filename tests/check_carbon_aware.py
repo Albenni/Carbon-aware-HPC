@@ -32,12 +32,14 @@ from hpc_sim import (
     CarbonSignal,
     Cluster,
     EASYBackfillScheduler,
+    FCFSScheduler,
     Job,
     RuntimeEstimateSource,
     Simulator,
     account_schedule,
     carbon_cost_gco2e,
     cheapest_start_time,
+    schedule_metrics,
     total_emissions_gco2e,
     total_energy_kwh,
 )
@@ -177,6 +179,30 @@ class CheapestStartTest(unittest.TestCase):
 
 
 class CarbonAwareSchedulerTest(unittest.TestCase):
+    def test_resource_only_job_contends_but_is_not_scored(self) -> None:
+        background = Job("background", BASE, BASE, 1, 600, power=None)
+        evaluated = make_job("evaluated", release_seconds=1, duration_seconds=600)
+        carbon = CarbonAwareScheduler(provider(), max_delay=timedelta(0))
+
+        for scheduler in (
+            FCFSScheduler(),
+            EASYBackfillScheduler(runtime_estimate=EXACT),
+            carbon,
+        ):
+            result = Simulator((background, evaluated), Cluster(1), scheduler).run()
+            by_id = {record.job_id: record for record in result.records}
+            self.assertEqual(by_id["evaluated"].start_time, BASE + timedelta(seconds=600))
+            with self.assertRaisesRegex(ValueError, "select the evaluation"):
+                account_schedule(result, (background, evaluated), provider())
+
+            cohort = result.replace_records((by_id["evaluated"],))
+            metrics = schedule_metrics(account_schedule(cohort, (evaluated,), provider()))
+            self.assertEqual(metrics.job_count, 1)
+            self.assertEqual(metrics.peak_busy_nodes, 1)
+            self.assertEqual(metrics.utilisation, 1.0)
+
+        self.assertEqual(carbon.target_start_times["background"], BASE)
+
     def test_a_zero_budget_reproduces_easy_exactly(self) -> None:
         jobs = [make_job(index, release_seconds=index * 30, nodes=2) for index in range(8)]
         easy = run(jobs, EASYBackfillScheduler(runtime_estimate=EXACT))

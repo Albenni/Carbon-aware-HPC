@@ -66,17 +66,26 @@ def account_schedule(
 
     Accounting happens here, after the event loop, so the engine stays
     carbon-agnostic and a forecast provider can be substituted without touching
-    it.
+    it. Resource-only jobs must be removed from the result first: without a
+    power profile there is deliberately nothing to account.
     """
 
-    check_coverage(result, provider)
     by_id: Mapping[object, Job] = {job.job_id: job for job in jobs}
-
-    accounted = []
     for record in result.records:
         job = by_id.get(record.job_id)
         if job is None:
             raise KeyError(f"no job supplied for record {record.job_id}")
+        if job.power is None:
+            raise ValueError(
+                f"job {job.job_id} has no power profile; select the evaluation "
+                "records before accounting"
+            )
+    check_coverage(result, provider)
+
+    accounted = []
+    for record in result.records:
+        job = by_id[record.job_id]
+        assert job.power is not None
 
         average = account_emissions(
             job.power,

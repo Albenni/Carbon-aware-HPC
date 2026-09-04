@@ -35,7 +35,7 @@ from hpc_sim import (
     account_schedule,
     schedule_metrics,
 )
-from hpc_sim.workload import load_jobs
+from hpc_sim.workload import load_contention_jobs, load_jobs
 
 from run_simulation import (
     DEFAULT_CARBON_CACHE,
@@ -103,6 +103,16 @@ class SweepPoint:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", type=Path, default=DEFAULT_WORKLOAD)
+    parser.add_argument(
+        "--contention-workload",
+        type=Path,
+        default=None,
+        metavar="RAW_PARQUET",
+        help=(
+            "add valid terminal non-COMPLETED jobs from the raw PM100 trace "
+            "as resource-only scheduler demand"
+        ),
+    )
     parser.add_argument("--carbon-cache", type=Path, default=DEFAULT_CARBON_CACHE)
     parser.add_argument("--nodes", type=int, default=PM100_PARTITION_1_NODES)
     parser.add_argument("--limit", type=int, default=None)
@@ -148,12 +158,27 @@ def main() -> int:
     arguments = build_parser().parse_args()
     estimate = RuntimeEstimateSource(arguments.runtime_estimate)
 
-    jobs = load_jobs(
+    evaluation_jobs = load_jobs(
         arguments.workload,
         limit=arguments.limit,
         released_from=arguments.released_from,
         released_before=arguments.released_before,
     )
+    evaluation_ids = {job.job_id for job in evaluation_jobs}
+    contention_jobs = ()
+    if arguments.contention_workload is not None:
+        window_start = arguments.released_from or min(
+            job.release_time for job in evaluation_jobs
+        )
+        window_end = arguments.released_before or max(
+            job.release_time for job in evaluation_jobs
+        ) + timedelta(microseconds=1)
+        contention_jobs = load_contention_jobs(
+            arguments.contention_workload,
+            window_start=window_start,
+            window_end=window_end,
+        )
+    jobs = evaluation_jobs + contention_jobs
     provider = TimeSeriesCarbonIntensityProvider.load(arguments.carbon_cache)
     granularities = (
         [timedelta(minutes=minutes) for minutes in arguments.decision_granularity_minutes]
@@ -163,7 +188,12 @@ def main() -> int:
 
     def score(scheduler) -> ScheduleMetrics:
         result = Simulator(jobs, Cluster(arguments.nodes), scheduler).run()
-        return schedule_metrics(account_schedule(result, jobs, provider))
+        evaluation = result.replace_records(
+            tuple(record for record in result.records if record.job_id in evaluation_ids)
+        )
+        return schedule_metrics(
+            account_schedule(evaluation, evaluation_jobs, provider)
+        )
 
     # Both carbon-blind baselines are reported, because the saving only means
     # something if it does not depend on which of them it is measured against.
@@ -197,7 +227,14 @@ def main() -> int:
             )
 
     print(f"workload                 {arguments.workload.name}")
-    print(f"jobs                     {reference.job_count:,}")
+    if contention_jobs:
+        print(f"contention workload      {arguments.contention_workload.name}")
+        print(f"scheduled jobs           {len(jobs):,}")
+        print(f"evaluation jobs          {reference.job_count:,} COMPLETED")
+        print(f"contention-only jobs     {len(contention_jobs):,}")
+        print("metric boundary          QoS/carbon: evaluation; nodes: all jobs")
+    else:
+        print(f"jobs                     {reference.job_count:,}")
     print(f"cluster capacity         {arguments.nodes:,} nodes")
     print(f"runtime estimate         {estimate.value}")
     for baseline in references:
@@ -223,17 +260,31 @@ def main() -> int:
         )
 
     print()
-    print("energy is identical across every row; only the timing of it changes.")
+    if contention_jobs:
+        print("evaluated-cohort energy is identical; only its timing changes.")
+    else:
+        print("energy is identical across every row; only the timing of it changes.")
 
     if arguments.no_output:
         return 0
 
-    destination = arguments.output or (
-        DEFAULT_OUTPUT_DIR
-        / f"carbon_tradeoff_{reference.job_count}jobs_{arguments.nodes}nodes.csv"
+    destination = arguments.output or DEFAULT_OUTPUT_DIR / (
+        f"carbon_tradeoff_terminal_contention_{reference.job_count}evaluated_"
+        f"{arguments.nodes}nodes.csv"
+        if contention_jobs
+        else f"carbon_tradeoff_{reference.job_count}jobs_{arguments.nodes}nodes.csv"
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     rows = [point.as_row() for point in points]
+    if contention_jobs:
+        rows = [
+            {
+                "scheduled_jobs": len(jobs),
+                "contention_only_jobs": len(contention_jobs),
+                **row,
+            }
+            for row in rows
+        ]
     with destination.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()

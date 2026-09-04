@@ -191,6 +191,10 @@ class CarbonAwareScheduler(EASYBackfillScheduler):
     still push it later; the delay attributable to the carbon decision is the
     part this parameter bounds. ``max_delay=0`` reproduces EASY exactly, which
     is what makes the trade-off sweep start from a known point.
+
+    A job without an accounting power profile is offered to EASY immediately.
+    It participates in queueing and node contention, but the policy neither
+    assigns it a carbon cost nor delays it for carbon reasons.
     """
 
     name = "carbon-aware"
@@ -236,11 +240,15 @@ class CarbonAwareScheduler(EASYBackfillScheduler):
         return MappingProxyType(self._targets)
 
     def on_release(self, job: Job, now: datetime, simulator: Simulator) -> None:
-        target = cheapest_start_time(
-            job,
-            self._signal,
-            max_delay=self._max_delay,
-            granularity=self._granularity,
+        target = (
+            job.release_time
+            if job.power is None
+            else cheapest_start_time(
+                job,
+                self._signal,
+                max_delay=self._max_delay,
+                granularity=self._granularity,
+            )
         )
         self._targets[job.job_id] = target
         if target > now:
@@ -254,4 +262,3 @@ class CarbonAwareScheduler(EASYBackfillScheduler):
     ) -> Iterable[Job]:
         del simulator
         return (job for job in queue if self._targets[job.job_id] <= now)
-

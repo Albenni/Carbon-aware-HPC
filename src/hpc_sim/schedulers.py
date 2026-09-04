@@ -234,6 +234,12 @@ class EASYBackfillScheduler(Scheduler):
     def _estimate(self, job: Job) -> float:
         return estimated_runtime_seconds(job, self._runtime_estimate)
 
+    def _power(self, job: Job) -> float:
+        """Power budget used by placement; plain EASY has no such budget."""
+
+        del job
+        return 0.0
+
     def select(
         self,
         now: datetime,
@@ -253,7 +259,7 @@ class EASYBackfillScheduler(Scheduler):
                 if self._admits(job, free_nodes, headroom):
                     started.append(job)
                     free_nodes -= job.nodes_required
-                    headroom -= job.scheduling_average_power_watts
+                    headroom -= self._power(job)
                     continue
                 pivot = job
                 continue
@@ -276,7 +282,7 @@ class EASYBackfillScheduler(Scheduler):
         # because a pivot blocked on power is starved just as effectively by a
         # job that takes its power as by one that takes its nodes.
         extra_nodes = max(0, nodes_at - pivot.nodes_required)
-        extra_power = max(0.0, power_at - pivot.scheduling_average_power_watts)
+        extra_power = max(0.0, power_at - self._power(pivot))
         if reservation <= now:
             # The projection says the pivot should already fit, so it disagrees
             # with the cluster. Rather than backfill against a reservation that
@@ -291,15 +297,15 @@ class EASYBackfillScheduler(Scheduler):
             if not ends_before_reservation:
                 if job.nodes_required > extra_nodes:
                     continue
-                if job.scheduling_average_power_watts > extra_power:
+                if self._power(job) > extra_power:
                     continue
             started.append(job)
             self._backfilled.add(job.job_id)
             free_nodes -= job.nodes_required
-            headroom -= job.scheduling_average_power_watts
+            headroom -= self._power(job)
             if not ends_before_reservation:
                 extra_nodes -= job.nodes_required
-                extra_power -= job.scheduling_average_power_watts
+                extra_power -= self._power(job)
 
         return tuple(started)
 
@@ -354,7 +360,7 @@ class EASYBackfillScheduler(Scheduler):
             (
                 max(now, start_time + seconds(self._estimate(job))),
                 job.nodes_required,
-                job.scheduling_average_power_watts,
+                self._power(job),
             )
             for job, start_time in simulator.running
         ]
@@ -362,13 +368,13 @@ class EASYBackfillScheduler(Scheduler):
             (
                 now + seconds(self._estimate(job)),
                 job.nodes_required,
-                job.scheduling_average_power_watts,
+                self._power(job),
             )
             for job in starting
         )
         releases.sort(key=lambda release: release[0])
 
-        needed_power = pivot.scheduling_average_power_watts
+        needed_power = self._power(pivot)
         nodes = free_nodes
         power = headroom_watts
         for index, (when, released_nodes, released_power) in enumerate(releases):
@@ -440,21 +446,27 @@ class PowerCappedEASYScheduler(EASYBackfillScheduler):
         # A job drawing more than the whole budget could never start, and would
         # stall the queue forever. That is a configuration error, so say so now
         # rather than through an exhausted event loop much later.
-        if job.scheduling_average_power_watts > self._power_cap_watts:
+        power_watts = self._power(job)
+        if power_watts > self._power_cap_watts:
             raise SimulationError(
                 f"job {job.job_id} draws "
-                f"{job.scheduling_average_power_watts:,.0f} W on average, above "
+                f"{power_watts:,.0f} W on average, above "
                 f"the {self._power_cap_watts:,.0f} W cap, so it can never start"
             )
+
+    def _power(self, job: Job) -> float:
+        if job.power is None and job.predicted_average_power_watts is None:
+            raise SimulationError(
+                f"job {job.job_id} has no power estimate required by the power cap"
+            )
+        return job.scheduling_average_power_watts
 
     def _admits(self, job: Job, free_nodes: int, headroom_watts: float) -> bool:
         if job.nodes_required > free_nodes:
             return False
-        return job.scheduling_average_power_watts <= headroom_watts
+        return self._power(job) <= headroom_watts
 
     def _power_headroom(self, now: datetime, simulator: Simulator) -> float:
         del now
-        drawn = sum(
-            job.scheduling_average_power_watts for job, _ in simulator.running
-        )
+        drawn = sum(self._power(job) for job, _ in simulator.running)
         return self._power_cap_watts - drawn

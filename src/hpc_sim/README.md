@@ -175,6 +175,11 @@ substituting predictions turns the oracle into the realistic scenario without
 touching the policy. Evaluation still integrates the measured profile, and
 `average_model_gap` reports the residual difference on every run.
 
+A job with `power=None` follows ordinary EASY placement immediately. It can
+block, backfill, allocate nodes and release them, but it has no carbon target.
+This is how terminal PM100 executions add resource contention without receiving
+an invented power value.
+
 The rule is greedy and per job: every
 job independently aims at the same clean interval, and the queueing that
 collectively creates is a cost the rule does not model. Perfect information
@@ -205,6 +210,11 @@ carbon-agnostic, so a forecast provider can be substituted later
 without touching it. `check_coverage` fails early and legibly when a schedule
 runs past the end of the cached series, instead of dying inside an accounting
 loop with a bare missing-bucket error.
+
+For a mixed resource workload, `SimulationResult.replace_records` selects the
+clean evaluation ids before accounting. It preserves the full run's busy-node
+time, peak and makespan while keeping terminal jobs out of energy, carbon and
+per-job QoS summaries.
 
 Jobs are loaded with the **duration-weighted** mean of the measured profile, not
 the stored `node_power_mean_W` arithmetic mean. Only the weighted mean makes the
@@ -315,6 +325,10 @@ module that needs pyarrow.
 .venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
   --max-delay-hours 6 24 --decision-granularity-minutes 15 60 240
 
+# the same FCFS/EASY/carbon experiment with terminal jobs consuming nodes
+.venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
+  --contention-workload data/job_table.parquet --max-delay-hours 0 6
+
 .venv/bin/python tests/check_simulator.py
 .venv/bin/python tests/check_baselines.py
 .venv/bin/python tests/check_carbon_aware.py
@@ -334,6 +348,12 @@ the 5,000-job debug subset and the full 157,062-job clean trace it reproduces
 774 nodes matches an independent sweep-line computation over the source table.
 That is the engine's ground-truth anchor. FCFS on the full trace reaches exactly
 880 busy nodes and never exceeds them.
+
+The terminal-contention loader admits 50,165 valid non-completed partition-1
+executions: 29,561 failed, 10,876 cancelled, 8,564 timed out, 997 out of memory
+and 167 node failures. They all enter the event simulator without a power
+profile. One additional timed-out execution has eligibility before submission
+and 18 rows have no positive execution interval; none is repaired or admitted.
 
 Energy is identical across policies (553.34 MWh on the full trace, every
 scheduler, to six decimals) while emissions differ (156.333 tCO2e for replay
@@ -467,19 +487,17 @@ is the sensitivity analysis the final experiments still owe.
 The six-point sweep over the full trace takes about half an hour, again almost
 entirely emission accounting.
 
-## Interpreting the comparison — important caveat
+## Interpreting the comparison
 
-**FCFS shows a _lower_ mean waiting time than the historical replay** (278 s vs
-2,434 s on the full trace). This is not evidence that FCFS beats the production
-scheduler. The simulated workload is a strict subset of what the machine really
-ran: the dataset inspection removed all non-`COMPLETED` jobs (50,928 of them) and every job
-failing power profile validation, and other partitions are excluded entirely.
-Node utilisation is therefore only ~20%, while the recorded waiting times were
-produced under the _full_ contention of jobs that are absent here.
+The original results remain the controlled clean-cohort experiment. The
+additional terminal-contention scenario schedules the same clean ids together
+with valid `FAILED`, `CANCELLED`, `TIMEOUT`, `OUT_OF_MEMORY` and `NODE_FAIL`
+executions. On the 5,000-job debug cohort this adds 2,227 jobs, raises EASY node
+utilisation from 9.7% to 20.6%, and raises mean clean-cohort waiting from 31.2 s
+to 87.8 s. This confirms that the extra records affect placement rather than
+only an offline occupancy calculation.
 
-Replay's waiting times are consequently **not** a comparable performance
-baseline; only its start times are meaningful, as a fidelity check. Scheduling
-policies must be compared against each other on the same simulated workload,
-which is what the baseline results above do. This is the concrete form of the
-filtering bias concern and it should be quantified before the final
-experiments.
+The outcome remains counterfactual: rescheduling preserves each terminal job's
+observed duration and allocation but does not model why it failed or was
+cancelled. The exact selection rules, status counts and results are documented
+in [PM100 terminal-job contention](../../docs/PM100_features.md#terminal-job-contention-scenario).

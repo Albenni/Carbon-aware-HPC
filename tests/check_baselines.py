@@ -347,6 +347,11 @@ class EASYReservationInvariantTest(unittest.TestCase):
 class PowerCapTest(unittest.TestCase):
     """The energy-aware baseline: a budget on power, blind to the grid."""
 
+    def test_a_job_without_power_is_rejected(self) -> None:
+        job = Job("resource-only", BASE, BASE, 1, 60, power=None)
+        with self.assertRaisesRegex(SimulationError, "no power estimate"):
+            Simulator((job,), Cluster(1), PowerCappedEASYScheduler(1_000)).run()
+
     def test_the_cap_is_never_exceeded(self) -> None:
         for seed in (2, 4, 6):
             with self.subTest(seed=seed):

@@ -50,12 +50,12 @@ class Job:
     """One schedulable unit of work, with its ground truth and its predictions.
 
     The simulator decides *when* the job runs. ``power`` carries the accounting
-    input that :mod:`carbon_accounting` consumes; that package deliberately keeps
-    ``JobPowerProfile`` free of scheduling concerns and expects it to be embedded
-    here.
+    input that :mod:`carbon_accounting` consumes when it is available. A job
+    with ``power=None`` still consumes and releases nodes, but cannot be used for
+    energy or carbon evaluation.
 
     ``actual_duration_seconds`` always governs when nodes are released. The
-    optional ``predicted_*`` fields exist so a later phase can let a scheduler
+    optional ``predicted_*`` fields let a scheduler
     decide on estimates while the simulated execution stays truthful; a policy
     must read :attr:`scheduling_duration_seconds` rather than the actual value.
     """
@@ -65,15 +65,15 @@ class Job:
     release_time: datetime
     nodes_required: int
     actual_duration_seconds: float
-    power: JobPowerProfile
+    power: JobPowerProfile | None
     time_limit_seconds: float | None = None
     trace_start_time: datetime | None = None
     predicted_duration_seconds: float | None = None
     predicted_average_power_watts: float | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.power, JobPowerProfile):
-            raise TypeError("power must be a JobPowerProfile")
+        if self.power is not None and not isinstance(self.power, JobPowerProfile):
+            raise TypeError("power must be a JobPowerProfile or None")
 
         submit_time = _aware_utc(self.submit_time, "submit_time")
         release_time = _aware_utc(self.release_time, "release_time")
@@ -87,8 +87,8 @@ class Job:
             self.actual_duration_seconds,
             "actual_duration_seconds",
         )
-        # The accounting profile and the schedule must describe one execution.
-        if duration != self.power.duration_seconds:
+        # When accounting data exists, it must describe this same execution.
+        if self.power is not None and duration != self.power.duration_seconds:
             raise ValueError(
                 "actual_duration_seconds must equal power.duration_seconds: "
                 f"{duration:g}s vs {self.power.duration_seconds:g}s"
@@ -139,7 +139,7 @@ class Job:
         """Duration a scheduler is allowed to use when deciding.
 
         Falls back to the actual duration only while no prediction exists, which
-        is the perfect-information setting of the early phases.
+        is the current perfect-information setting.
         """
 
         if self.predicted_duration_seconds is not None:
@@ -157,6 +157,8 @@ class Job:
 
         if self.predicted_average_power_watts is not None:
             return self.predicted_average_power_watts
+        if self.power is None:
+            raise ValueError(f"job {self.job_id} has no scheduling power estimate")
         return self.power.average_power_watts
 
     @property

@@ -333,15 +333,16 @@ required to achieve those savings?**
   but it should be reconsidered if DVFS, migration, or heterogeneous hardware are introduced.
 - PM100 samples do not retain individual timestamps: the first sample is
   realigned to the simulated start time.
-- The initial dataset includes completed jobs with no observed node-time overlaps
-  and valid profiles. The potential bias introduced by these filters
-  must be measured before the final experiments. One consequence is already
-  visible: the simulated workload is a strict subset of what the machine really
-  ran, so node utilisation reaches only about 20% and simulated FCFS waiting
-  times come out _below_ the historical ones. The recorded waiting times were
-  produced under contention with jobs that the filters removed, so trace replay
-  is a fidelity check on start times and not a comparable performance baseline.
-  Policies must be compared against each other on the same simulated workload.
+- The carbon and QoS evaluation cohort contains only completed jobs with valid
+  profiles. An additional resource contention scenario schedules it together
+  with 50,165 valid terminal non completed executions. Those executions consume
+  their observed allocated nodes for their observed duration but carry no power
+  profile and receive no carbon score. On the 5,000-job debug cohort they raise
+  EASY utilisation from 9.7% to 20.6% and mean evaluated waiting from 31.2 s to
+  87.8 s. This makes contention more representative without changing the ids or
+  accounting boundary used to compare policies. Selection rules and status
+  counts are reported in
+  [PM100 terminal-job contention](PM100_features.md#terminal-job-contention-scenario).
 - The entire input power to the nodes during execution is assigned to the job,
   rather than an incremental estimate relative to an idle baseline; the
   overall site consumption remains outside the model.

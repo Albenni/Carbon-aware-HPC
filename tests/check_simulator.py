@@ -42,6 +42,7 @@ from hpc_sim import (
 UTC = timezone.utc
 BASE = datetime(2020, 5, 6, 0, 0, tzinfo=UTC)
 DEBUG_TRACE = PROJECT_ROOT / "data" / "processed" / "pm100_debug_5000.parquet"
+RAW_TRACE = PROJECT_ROOT / "data" / "job_table.parquet"
 CARBON_CACHE = (
     PROJECT_ROOT
     / "data"
@@ -590,6 +591,23 @@ class PM100TraceTest(unittest.TestCase):
         )
         relative_gap = abs(measured_g - average_g) / measured_g
         self.assertLess(relative_gap, 0.05)
+
+
+@unittest.skipUnless(RAW_TRACE.exists(), f"{RAW_TRACE.name} is not present")
+class PM100ContentionLoaderTest(unittest.TestCase):
+    def test_loads_only_schedulable_terminal_executions(self) -> None:
+        from hpc_sim.workload import load_contention_jobs
+
+        jobs = load_contention_jobs(RAW_TRACE)
+        self.assertEqual(len(jobs), 50_165)
+        self.assertTrue(all(job.power is None for job in jobs))
+        self.assertTrue(
+            all(
+                job.trace_start_time is not None
+                and job.release_time <= job.trace_start_time
+                for job in jobs
+            )
+        )
 
 
 if __name__ == "__main__":
