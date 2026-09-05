@@ -16,11 +16,13 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from carbon_accounting import JobPowerProfile, carbon_emissions
 from carbon_intensity import (
@@ -47,6 +49,8 @@ from hpc_sim import (
     total_emissions_gco2e,
     total_energy_kwh,
 )
+
+from carbon_tradeoff import SweepPoint, assign_carbon_benefit_retained
 
 
 UTC = timezone.utc
@@ -351,6 +355,48 @@ class PM100CarbonAwareTest(unittest.TestCase):
         self.assertLess(short, baseline)
         for energy in (short_energy, long_energy):
             self.assertAlmostEqual(energy, baseline_energy, places=6)
+
+
+class SweepRetentionTest(unittest.TestCase):
+    """The sweep's predicted rows are scored against their own budget."""
+
+    def _point(self, emissions_tco2e: float, hours: float, inputs: str):
+        metrics = SimpleNamespace(total_emissions_gco2e=emissions_tco2e * 1e6)
+        return SweepPoint(
+            metrics,
+            max_delay=timedelta(hours=hours),
+            granularity=timedelta(minutes=15),
+            reference_emissions_gco2e=100.0e6,
+            inputs=inputs,
+        )
+
+    def test_retention_compares_like_budget_with_like(self) -> None:
+        points = [
+            self._point(100.0, 0.0, "actual"),
+            self._point(90.0, 6.0, "actual"),
+            self._point(80.0, 24.0, "actual"),
+            self._point(100.0, 0.0, "predicted"),
+            self._point(95.0, 6.0, "predicted"),
+            self._point(90.0, 24.0, "predicted"),
+        ]
+        assign_carbon_benefit_retained(points)
+
+        # Actual rows are the yardstick and never carry a share of themselves.
+        for point in points[:3]:
+            self.assertIsNone(point.carbon_benefit_retained)
+            self.assertEqual(point.retained, "-")
+        # Half of a 10% saving, and half of a 20% one: each against its own
+        # budget, not against the widest budget in the sweep.
+        self.assertIsNone(points[3].carbon_benefit_retained)
+        self.assertAlmostEqual(points[4].carbon_benefit_retained, 0.5)
+        self.assertAlmostEqual(points[5].carbon_benefit_retained, 0.5)
+        self.assertEqual(points[4].retained, "50.00%")
+
+    def test_a_predicted_row_that_emits_more_than_easy_is_negative(self) -> None:
+        points = [self._point(90.0, 6.0, "actual"), self._point(101.0, 6.0, "predicted")]
+        assign_carbon_benefit_retained(points)
+
+        self.assertAlmostEqual(points[1].carbon_benefit_retained, -0.1)
 
 
 if __name__ == "__main__":

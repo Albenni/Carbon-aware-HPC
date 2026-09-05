@@ -102,3 +102,26 @@ def attach_predictions(
     if not attached:
         raise ValueError("at least one job is required")
     return tuple(attached)
+
+
+def load_prediction_cohort(
+    workload: str | Path,
+    prediction_path: str | Path,
+) -> tuple[tuple[Job, ...], tuple[Job, ...]]:
+    """Load the artifact's cohort twice: with actual inputs, and with predicted.
+
+    The two tuples hold the same jobs in the artifact's order and differ only in
+    the estimates a scheduler may plan with, so any difference between two runs
+    over them is attributable to the model alone.
+    """
+
+    from hpc_sim.workload import load_jobs
+
+    predictions = load_prediction_file(prediction_path)
+    jobs_by_id = {job.job_id: job for job in load_jobs(workload, job_ids=set(predictions))}
+    missing = set(predictions).difference(jobs_by_id)
+    if missing:
+        preview = ", ".join(str(job_id) for job_id in sorted(missing, key=str)[:5])
+        raise ValueError(f"prediction ids absent from the workload: {preview}")
+    actual_jobs = tuple(jobs_by_id[job_id] for job_id in predictions)
+    return actual_jobs, attach_predictions(actual_jobs, predictions)

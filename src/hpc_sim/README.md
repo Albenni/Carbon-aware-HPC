@@ -397,6 +397,13 @@ module that needs pyarrow.
 .venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
   --max-delay-hours 6 24 --decision-granularity-minutes 15 60 240
 
+# the frontier a system that only has a model reaches: the held-out cohort
+# swept twice, actual durations against predicted ones
+.venv/bin/python scripts/carbon_tradeoff.py \
+  --workload data/processed/pm100_clean.parquet \
+  --job-predictions data/job_predictions/test_predictions.parquet \
+  --max-delay-hours 0 1 3 6 12 24 --decision-granularity-minutes 15
+
 # the same FCFS/EASY/carbon experiment with terminal jobs consuming nodes
 .venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
   --contention-workload data/job_table.parquet --max-delay-hours 0 6
@@ -562,6 +569,90 @@ is the sensitivity analysis the final experiments still owe.
 
 The six-point sweep over the full trace takes about half an hour, again almost
 entirely emission accounting.
+
+### With predicted scheduling inputs
+
+Everything above plans with perfect information. This sweep prices what the
+frontier is worth to a system that only has a model, and it is the same
+experiment twice over one cohort: the 23,560 held-out test jobs of
+[the job models](../job_prediction/README.md), 880 nodes, 15-minute grid, once
+planning with actual durations and once with the gradient model's. Only the
+estimates the policies plan with change; completion, energy and emissions are
+always scored from the measured trace.
+
+`saved` is measured against EASY on actual durations (17.4712 tCO2e) in every
+row, so the two halves share a denominator. `retained` is the share of that
+budget's perfect-information saving the model keeps.
+
+| delay budget | actual tCO2e | saved | predicted tCO2e |  saved | retained |
+| ------------ | -----------: | ----: | --------------: | -----: | -------: |
+| 0 (= EASY)   |      17.4712 | 0.00% |         17.4754 | -0.02% |        - |
+| 1 h          |      17.4347 | 0.21% |         17.4549 |  0.09% |   44.69% |
+| 3 h          |      17.3210 | 0.86% |         17.3951 |  0.44% |   50.66% |
+| 6 h          |      17.2402 | 1.32% |         17.3727 |  0.56% |   42.65% |
+| 12 h         |      16.9118 | 3.20% |         17.1681 |  1.73% |   54.18% |
+| 24 h         |      16.7036 | 4.39% |         17.0137 |  2.62% |   59.61% |
+
+The 6-hour row reproduces `job_prediction.scheduling_impact` exactly, which is
+worth stating because the two arrive there by different code paths.
+
+**The model keeps between two fifths and three fifths of the saving, and the
+wider the budget the more it keeps.** Retention rises from 44.7% at one hour to
+59.6% at twenty-four. A duration error costs carbon by moving the job's target
+into a different quarter-hour, and a wide budget offers more nearly-as-clean
+slots to land in, so the same error is cheaper there. The exception is the
+six-hour row at 42.65%, the lowest of the sweep; retention is not monotone
+because it depends on where the errors happen to fall against that particular
+window of the signal, not only on their size.
+
+**The frontier itself is flatter here than on the full trace** — 4.39% against
+7.10% at a 24-hour budget — because this cohort is the last ten days of the
+trace rather than all of it, and it meets a different stretch of the grid
+signal. Frontier numbers are comparable within one workload window and not
+across two, so the perfect-information column, not the table above, is what the
+predicted column should be read against.
+
+**Prediction error costs QoS before any carbon policy runs.** The zero-budget
+row is not zero: it emits 0.02% *more* than EASY on actual durations, and its
+mean waiting is 458.3 s against 422.9 s with a mean bounded slowdown of 3.00
+against 2.11. That row is plain EASY, so the loss is entirely backfill, and it
+is total: over the cohort EASY places 1,247 jobs differently from strict FCFS
+when it plans with actual durations, and **zero** when it plans with predicted
+ones. Its schedule is FCFS, job for job.
+
+The mechanism is the reservation guard in `EASYBackfillScheduler.select`. The
+pivot's reservation is projected from the estimated remaining time of the jobs
+holding the nodes, and the model under-predicts (bias -568 s overall, -14,140 s
+on jobs of at least three hours). Every running long job is therefore projected
+to have already finished, the reservation lands at or before `now`, and the
+scheduler — correctly, because a projection that disagrees with the cluster
+cannot be trusted — falls back to strict FCFS for that pass. It happens on
+1,696 of 1,696 passes that have a pivot. The ridge baseline does the same, and
+so does the gradient model with every duration halved; doubling them restores
+506 of the 1,247 placements. This is a property of under-prediction, not of
+these two models.
+
+The carbon-aware rows pay much less. At every budget the QoS gap between
+predicted and actual inputs is small — waiting mean +1.6% at six hours, +2.5%
+at twenty-four — because holding jobs for the grid signal dominates the
+schedule long before backfill does:
+
+| delay budget | wait mean (s) actual | predicted | bsld mean actual | predicted | peak MW actual | predicted |
+| ------------ | -------------------: | --------: | ---------------: | --------: | -------------: | --------: |
+| 0 (= EASY)   |                422.9 |     458.3 |             2.11 |      3.00 |          0.850 |     0.844 |
+| 1 h          |              1,500.7 |   1,524.9 |            72.04 |     72.72 |          0.855 |     0.852 |
+| 3 h          |              5,013.8 |   5,036.9 |           310.42 |    312.26 |          0.850 |     0.858 |
+| 6 h          |              7,870.7 |   7,922.7 |           459.98 |    463.07 |          0.856 |     0.855 |
+| 12 h         |             12,140.3 |  12,400.4 |           656.74 |    674.84 |          0.856 |     0.874 |
+| 24 h         |             42,542.2 |  43,584.9 |         2,979.30 |  2,991.06 |          0.870 |     0.904 |
+
+Peak power is the one place the model makes the concentration problem worse
+rather than merely smaller: 0.904 MW against 0.870 at the widest budget. Wrong
+durations aim jobs at the clean interval with the same enthusiasm and less
+accuracy about how long they will occupy it.
+
+Energy is 67.52 MWh in every row of both halves, as it must be: the cohort and
+its measured profiles never change.
 
 ## Interpreting the comparison
 

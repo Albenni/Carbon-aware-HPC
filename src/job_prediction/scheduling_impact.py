@@ -27,9 +27,8 @@ from hpc_sim import (
     bounded_slowdown,
     schedule_metrics,
 )
-from hpc_sim.workload import load_jobs
-
-from .integration import attach_predictions, load_prediction_file
+from .evaluation import DURATION_BANDS
+from .integration import load_prediction_cohort
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -45,13 +44,7 @@ DEFAULT_CARBON_CACHE = (
 )
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "job_predictions"
 
-_DURATION_BANDS = (
-    ("<10 s", 0.0, 10.0),
-    ("10-60 s", 10.0, 60.0),
-    ("1-10 min", 60.0, 600.0),
-    ("10-60 min", 600.0, 3_600.0),
-    (">=1 h", 3_600.0, float("inf")),
-)
+
 
 
 def decision_table(
@@ -169,7 +162,7 @@ def duration_band_table(frame: pd.DataFrame) -> pd.DataFrame:
     """Show whether the large relative duration errors belong to impactful jobs."""
 
     rows = []
-    for label, lower, upper in _DURATION_BANDS:
+    for label, lower, upper in DURATION_BANDS:
         selected = frame[
             (frame["actual_duration_s"] >= lower)
             & (frame["actual_duration_s"] < upper)
@@ -237,21 +230,6 @@ def _metric_table(
             row.update(summary)
         rows.append(row)
     return pd.DataFrame(rows)
-
-
-def _load_test_cohort(
-    workload: Path,
-    prediction_path: Path,
-) -> tuple[tuple[Job, ...], tuple[Job, ...]]:
-    predictions = load_prediction_file(prediction_path)
-    loaded = load_jobs(workload, job_ids=set(predictions))
-    jobs_by_id = {job.job_id: job for job in loaded}
-    missing = set(predictions).difference(jobs_by_id)
-    if missing:
-        preview = ", ".join(str(job_id) for job_id in sorted(missing, key=str)[:5])
-        raise ValueError(f"prediction ids absent from the workload: {preview}")
-    actual_jobs = tuple(jobs_by_id[job_id] for job_id in predictions)
-    return actual_jobs, attach_predictions(actual_jobs, predictions)
 
 
 def _print_report(
@@ -337,7 +315,7 @@ def main() -> int:
     arguments = build_parser().parse_args()
     max_delay = timedelta(hours=arguments.max_delay_hours)
     granularity = timedelta(minutes=arguments.decision_granularity_minutes)
-    actual_jobs, predicted_jobs = _load_test_cohort(
+    actual_jobs, predicted_jobs = load_prediction_cohort(
         arguments.workload, arguments.predictions
     )
     provider = TimeSeriesCarbonIntensityProvider.load(arguments.carbon_cache)

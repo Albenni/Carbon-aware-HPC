@@ -37,9 +37,21 @@ CATEGORICAL_FEATURES = ("qos",)
 SUBMISSION_FEATURES = (SUBMIT_TIME, *NUMERIC_FEATURES, *CATEGORICAL_FEATURES)
 TARGETS = (DURATION_SECONDS, AVERAGE_POWER_WATTS, ENERGY_KWH)
 
+# Also recorded at submission but unused by the ridge baseline. They are carried
+# through so richer feature builders can be compared against that baseline on
+# validation without a second pass over the measured power profiles.
+EXTRA_SUBMISSION_COLUMNS = (
+    "user_id",
+    "group_id",
+    "shared",
+    "req_switch",
+    "threads_per_core",
+)
+SUBMISSION_COLUMNS = (*SUBMISSION_FEATURES, *EXTRA_SUBMISSION_COLUMNS)
+
 _SOURCE_COLUMNS = (
     JOB_ID,
-    *SUBMISSION_FEATURES,
+    *SUBMISSION_COLUMNS,
     COMPLETION_TIME,
     "run_time",
     "node_power_consumption",
@@ -125,7 +137,7 @@ def load_job_data(
             batch["node_power_consumption"].to_pylist(),
         )
         features = pyarrow.Table.from_batches([batch]).select(
-            [JOB_ID, *SUBMISSION_FEATURES, COMPLETION_TIME]
+            [JOB_ID, *SUBMISSION_COLUMNS, COMPLETION_TIME]
         ).to_pandas()
         features[DURATION_SECONDS] = durations
         features[AVERAGE_POWER_WATTS] = powers
