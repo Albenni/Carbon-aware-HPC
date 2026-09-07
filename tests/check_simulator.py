@@ -10,12 +10,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
-import sys
 import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from carbon_accounting import JobPowerProfile
 from carbon_intensity import (
@@ -118,19 +116,6 @@ def synthetic_provider(
             for index, value in enumerate(values)
         )
     )
-
-
-class CountingCarbonScheduler(FCFSScheduler):
-    """FCFS that also opts into carbon-intensity boundary events."""
-
-    name = "fcfs-carbon-aware-wakeups"
-    wants_carbon_intensity_events = True
-
-    def __init__(self) -> None:
-        self.boundaries: list[datetime] = []
-
-    def on_carbon_intensity_change(self, now, simulator) -> None:
-        self.boundaries.append(now)
 
 
 class ExactScheduleTest(unittest.TestCase):
@@ -290,32 +275,6 @@ class CapacityInvariantTest(unittest.TestCase):
 
 
 class EventSourceTest(unittest.TestCase):
-    def test_carbon_boundaries_are_emitted_only_when_requested(self) -> None:
-        jobs = [make_job("j", duration_seconds=3_600, nodes=1)]
-
-        blind = Simulator(
-            jobs,
-            Cluster(1),
-            FCFSScheduler(),
-            carbon_intensity_granularity=FIFTEEN_MINUTES,
-        ).run()
-        self.assertEqual(len(blind.records), 1)
-
-        scheduler = CountingCarbonScheduler()
-        Simulator(
-            jobs,
-            Cluster(1),
-            scheduler,
-            carbon_intensity_granularity=FIFTEEN_MINUTES,
-        ).run()
-
-        # A one-hour job starting on a bucket edge crosses three interior
-        # boundaries; generation stops once nothing is queued or running.
-        self.assertEqual(
-            scheduler.boundaries,
-            [BASE + index * FIFTEEN_MINUTES for index in (1, 2, 3, 4)],
-        )
-
     def test_wakeup_in_the_past_is_rejected(self) -> None:
         class BadScheduler(FCFSScheduler):
             def select(self, now, queue, cluster, simulator):

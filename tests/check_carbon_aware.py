@@ -21,20 +21,21 @@ import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))  # scripts/ is not a package
 
 from carbon_accounting import JobPowerProfile, carbon_emissions
 from carbon_intensity import (
+    CarbonIntensityForecast,
     CarbonIntensitySample,
+    ForecastUnavailableError,
     MissingCarbonIntensityError,
     TimeSeriesCarbonIntensityProvider,
 )
+from carbon_intensity.snapshots import ArchiveCarbonIntensityProvider, ForecastArchive
 from hpc_sim import (
     CarbonAwareScheduler,
     CarbonSignal,
     Cluster,
-    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
     FCFSScheduler,
     Job,
@@ -217,7 +218,7 @@ class CarbonAwareSchedulerTest(unittest.TestCase):
         carbon = run(jobs, CarbonAwareScheduler(provider(), max_delay=timedelta(0)))
         self.assertEqual(start_times(easy), start_times(carbon))
         scaled = run(
-            jobs, DurationScaledCarbonAwareScheduler(provider(), max_delay_fraction=0)
+            jobs, CarbonAwareScheduler(provider(), max_delay_fraction=0)
         )
         self.assertEqual(start_times(easy), start_times(scaled))
 
@@ -238,9 +239,7 @@ class CarbonAwareSchedulerTest(unittest.TestCase):
         )
         targets = {}
         for job in (actual, predicted):
-            scheduler = DurationScaledCarbonAwareScheduler(
-                provider(), max_delay_fraction=1.0
-            )
+            scheduler = CarbonAwareScheduler(provider(), max_delay_fraction=1.0)
             run((job,), scheduler)
             targets[job.job_id] = scheduler.target_start_times[job.job_id]
 
@@ -397,6 +396,78 @@ class SweepRetentionTest(unittest.TestCase):
         assign_carbon_benefit_retained(points)
 
         self.assertAlmostEqual(points[1].carbon_benefit_retained, -0.1)
+
+
+class SealedProvider(ArchiveCarbonIntensityProvider):
+    """An archive whose observations are unreachable: a read while deciding is a bug."""
+
+    def get_actual(self, timestamp):
+        raise AssertionError("a scheduling decision read the actual series")
+
+    def get_actual_range(self, start, end):
+        raise AssertionError("a scheduling decision read the actual series")
+
+
+def sealed_archive(clean_from: datetime) -> SealedProvider:
+    """Hourly snapshots predicting a clean window that starts at ``clean_from``."""
+
+    snapshots = tuple(
+        CarbonIntensityForecast(
+            issue,
+            tuple(
+                CarbonIntensitySample(
+                    issue + index * QUARTER,
+                    DIRTY if issue + index * QUARTER < clean_from else CLEAN,
+                )
+                for index in range(96)
+            ),
+        )
+        for issue in (BASE + hour * timedelta(hours=1) for hour in range(12))
+    )
+    return SealedProvider(provider(), ForecastArchive({"schema_version": 1}, snapshots))
+
+
+class ForecastCarbonAwareSchedulerTest(unittest.TestCase):
+    """The realistic policy: same decisions, but only from what was issued."""
+
+    def test_the_decision_follows_the_forecast_and_never_the_actual_series(self) -> None:
+        # The forecast is wrong on purpose: it moves the clean window two hours
+        # past the truth, so a policy reading actuals could not produce 04:00.
+        wrong = BASE + timedelta(hours=4)
+        jobs = [make_job("j")]
+        scheduler = CarbonAwareScheduler(
+            sealed_archive(wrong), forecast=True, max_delay=timedelta(hours=6)
+        )
+        result = run(jobs, scheduler)
+
+        self.assertEqual(start_times(result)["j"], wrong)
+        self.assertEqual(scheduler.target_start_times["j"], wrong)
+        # Emissions are still charged against what the grid really did.
+        self.assertAlmostEqual(total_emissions_gco2e(result), CLEAN * 1_000 * 600 / 3_600_000)
+        # The decision is attributable to one issued snapshot, the latest at release.
+        self.assertEqual(scheduler.forecast_issue_times["j"], BASE)
+
+    def test_a_zero_budget_reproduces_easy_without_reading_a_forecast(self) -> None:
+        jobs = [make_job(index, release_seconds=index * 30, nodes=2) for index in range(8)]
+        easy = run(jobs, EASYBackfillScheduler(runtime_estimate=EXACT))
+        scheduler = CarbonAwareScheduler(
+            sealed_archive(CLEAN_FROM), forecast=True, max_delay=timedelta(0)
+        )
+
+        self.assertEqual(start_times(run(jobs, scheduler)), start_times(easy))
+        self.assertEqual(dict(scheduler.forecast_issue_times), {})
+
+    def test_a_window_the_archive_cannot_cover_is_refused(self) -> None:
+        # A 24-hour trajectory issued at release cannot score a 20-hour budget
+        # on top of a 10-hour job, and inventing the tail is not an option.
+        job = make_job("long", duration_seconds=36_000)
+        with self.assertRaises(ForecastUnavailableError):
+            run(
+                [job],
+                CarbonAwareScheduler(
+                    sealed_archive(CLEAN_FROM), forecast=True, max_delay=timedelta(hours=20)
+                ),
+            )
 
 
 if __name__ == "__main__":

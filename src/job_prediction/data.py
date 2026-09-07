@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 import pandas as pd
 
-from carbon_accounting import (
-    JobPowerProfile,
-    energy_from_measured_profile,
-)
+from carbon_accounting import JobPowerProfile, energy_from_measured_profile
+
+# Energy accounting owns the unit conversion; a second copy of the magic number
+# in this package is one that can drift away from it.
+from carbon_accounting.accounting import WATT_SECONDS_PER_KILOWATT_HOUR
 
 
 JOB_ID = "job_id"
@@ -36,6 +38,44 @@ NUMERIC_FEATURES = (
 CATEGORICAL_FEATURES = ("qos",)
 SUBMISSION_FEATURES = (SUBMIT_TIME, *NUMERIC_FEATURES, *CATEGORICAL_FEATURES)
 TARGETS = (DURATION_SECONDS, AVERAGE_POWER_WATTS, ENERGY_KWH)
+
+PREDICTED_DURATION_SECONDS = "predicted_duration_seconds"
+PREDICTED_AVERAGE_POWER_WATTS = "predicted_average_power_watts"
+PREDICTED_ENERGY_KWH = "predicted_energy_kwh"
+
+#: Bumped when a saved predictor stops loading; shared by both model families.
+MODEL_FORMAT_VERSION = 1
+
+
+class PredictionComposition(str, Enum):
+    """Two physically consistent ways to combine the learned targets."""
+
+    DURATION_POWER = "duration+power"
+    DURATION_ENERGY = "duration+energy"
+
+
+def require_columns(frame: pd.DataFrame, columns: tuple[str, ...]) -> None:
+    missing = set(columns).difference(frame.columns)
+    if missing:
+        raise ValueError(f"missing columns: {', '.join(sorted(missing))}")
+
+
+def completed_by(
+    frame: pd.DataFrame,
+    cutoff: object,
+    *,
+    period_name: str,
+) -> pd.DataFrame:
+    """Rows whose outcome was observable at a model-training cutoff."""
+
+    require_columns(frame, (COMPLETION_TIME,))
+    completion_times = pd.to_datetime(frame[COMPLETION_TIME], utc=True, errors="raise")
+    if completion_times.isna().any():
+        raise ValueError(f"{COMPLETION_TIME} cannot be missing")
+    available = frame.loc[completion_times <= cutoff].reset_index(drop=True)
+    if available.empty:
+        raise ValueError(f"no {period_name} targets were available by the cutoff")
+    return available
 
 # Also recorded at submission but unused by the ridge baseline. They are carried
 # through so richer feature builders can be compared against that baseline on

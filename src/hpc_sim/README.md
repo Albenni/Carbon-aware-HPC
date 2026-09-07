@@ -24,11 +24,10 @@ available to a job starting at `t`, with no ordering subtlety between the two
 events. Ties are broken by a monotonic sequence counter, so a run is fully
 deterministic.
 
-`CARBON_INTENSITY_CHANGE` is emitted only for a scheduler that sets
-`wants_carbon_intensity_events`. FCFS is carbon blind and never sees one; the
-source exists for the carbon-aware policies of later schedulers, which need to reconsider
-a deferred job when the signal moves. Boundary generation stops once nothing is
-queued or running, so it cannot keep a simulation alive forever.
+There is no bucket-boundary event. A carbon-aware policy decides once, at
+release, against a signal it already knows, so it asks for a `TIMER` at exactly
+the instant it chose rather than being woken at every boundary: the deferral
+costs one event per deferred job instead of one per bucket.
 
 ## Resources
 
@@ -53,11 +52,9 @@ FCFS queue forever.
 ```python
 class Scheduler(ABC):
     name: str
-    wants_carbon_intensity_events: bool = False
 
     def select(self, now, queue, cluster, simulator) -> tuple[Job, ...]: ...
     def on_release(self, job, now, simulator) -> None: ...
-    def on_carbon_intensity_change(self, now, simulator) -> None: ...
 ```
 
 - **`FCFSScheduler`** considers jobs in `(release_time, job_id)` order and stops
@@ -74,9 +71,21 @@ class Scheduler(ABC):
   aggregate power budget. See below for why the budget is on power and not on
   energy.
 - **`CarbonAwareScheduler`** is EASY plus one carbon decision per job: hold it
-  until the cleanest start time within its delay budget. See below.
-- **`DurationScaledCarbonAwareScheduler`** gives each job a delay budget
-  proportional to the duration available to the scheduler.
+  until the cleanest start time within its delay budget. Three keyword
+  arguments, and nothing else, separate the policies it implements:
+  - `max_delay` **or** `max_delay_fraction` — a fixed delay budget, or a per-job
+    one proportional to the duration available to the scheduler.
+  - `forecast=True` — decide against the forecast already issued at release
+    rather than against the observations, so a run differs from its oracle in
+    the signal and in nothing else.
+  - `reach` — cap the budget at what a finite forecast can cover. The oracle
+    takes the same cap as its forecast counterpart, otherwise the two would
+    differ in budget as well as in signal.
+
+  It reports itself under the name that combination earns (`carbon-aware`,
+  `carbon-scaled-delay`, `carbon-aware-forecast`,
+  `carbon-forecast-scaled-delay`, each optionally `-bounded`), so the tables
+  read as before.
 - **`PowerCappedCarbonAwareScheduler`** makes the same carbon decision, then
   admits ready jobs only while aggregate scheduled power remains under the cap.
 - **`TraceReplayScheduler`** starts each job at its recorded `start_time`. It is
@@ -192,7 +201,7 @@ belongs to the later optimisation formulation (§2.7).
 
 ### Duration-scaled carbon delay
 
-`DurationScaledCarbonAwareScheduler` replaces the single wall-clock budget
+`max_delay_fraction` replaces the single wall-clock budget
 with `scheduling_duration_seconds × max_delay_fraction`. A factor of `1.0`
 means that a job may voluntarily wait up to 100% of its predicted runtime;
 without a prediction, the actual duration remains the existing
@@ -344,7 +353,6 @@ from datetime import timedelta
 
 from hpc_sim import (
     CarbonAwareScheduler,
-    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
     PowerCappedCarbonAwareScheduler,
     PowerCappedEASYScheduler,
@@ -355,8 +363,12 @@ EASYBackfillScheduler()                                       # classic, plans o
 EASYBackfillScheduler(runtime_estimate=RuntimeEstimateSource.SCHEDULING)  # perfect information
 PowerCappedEASYScheduler(power_cap_watts=680_000.0)           # energy-aware baseline
 CarbonAwareScheduler(provider, max_delay=timedelta(hours=6))  # carbon-aware oracle
-DurationScaledCarbonAwareScheduler(                          # delay = predicted duration
-    provider, max_delay_fraction=1.0
+CarbonAwareScheduler(provider, max_delay_fraction=1.0)        # delay = predicted duration
+CarbonAwareScheduler(                                         # issued forecasts only
+    archive_provider, forecast=True, max_delay=timedelta(hours=6), reach=reach
+)
+CarbonAwareScheduler(                                         # both restrictions at once
+    archive_provider, forecast=True, max_delay_fraction=1.0, reach=reach
 )
 PowerCappedCarbonAwareScheduler(                              # carbon plus the same cap
     provider, 680_000.0, max_delay=timedelta(hours=6)
@@ -377,6 +389,14 @@ module that needs pyarrow.
   --max-delay-fraction 1 --runtime-estimate scheduling
 .venv/bin/python scripts/run_simulation.py --scheduler carbon-power-cap \
   --power-cap-mw 0.485 --max-delay-hours 6 --runtime-estimate scheduling
+.venv/bin/python scripts/run_simulation.py --scheduler carbon-forecast \
+  --carbon-cache data/carbon_intensity/actual/actual.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
+  --max-delay-hours 6 --runtime-estimate scheduling
+.venv/bin/python scripts/run_simulation.py --scheduler carbon-forecast-scaled-delay \
+  --carbon-cache data/carbon_intensity/actual/actual.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
+  --max-delay-fraction 1 --runtime-estimate scheduling
 
 # held-out jobs, predicted inputs for decisions, actual outcomes for scoring
 .venv/bin/python scripts/train_job_models.py
@@ -391,6 +411,30 @@ module that needs pyarrow.
 .venv/bin/python scripts/compare_baselines.py --limit 5000 --no-replay \
   --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1 \
   --power-cap-fraction 0.8
+
+# ... and the same policies on issued forecasts, with oracle recovery per archive
+.venv/bin/python scripts/compare_baselines.py --limit 5000 --no-replay \
+  --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1 \
+  --carbon-cache data/carbon_intensity/actual/actual.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_seasonal_daily.json
+
+# the whole matrix in one CSV: job information x carbon signal x delay policy.
+# Each --job-predictions artifact adds a labelled arm, and the cohort they all
+# cover is also run with actual durations and power; each --forecast-archive
+# adds a signal arm, all of them bounded by one shared reach together with the
+# oracle their oracle_recovery is measured against. Scoring stays ex post:
+# measured power profiles against observed intensity, whatever a run planned on.
+.venv/bin/python scripts/compare_baselines.py --no-replay \
+  --workload data/processed/pm100_clean.parquet \
+  --job-predictions gradient=data/job_predictions/test_predictions.parquet \
+  --job-predictions ridge=data/job_predictions/ridge_baseline/test_predictions.parquet \
+  --carbon-cache data/carbon_intensity/actual/actual.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_persistence.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_seasonal_daily.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_seasonal_weekly.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
+  --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1
 
 # the carbon / QoS frontier: one run per delay budget, EASY as the reference
 .venv/bin/python scripts/carbon_tradeoff.py --limit 5000
@@ -408,10 +452,21 @@ module that needs pyarrow.
 .venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
   --contention-workload data/job_table.parquet --max-delay-hours 0 6
 
+# every test in the repository, including the carbon_intensity in-package checks
+.venv/bin/python -m unittest discover -s tests -p "check_*.py"
+
+# or one file at a time
 .venv/bin/python tests/check_simulator.py
 .venv/bin/python tests/check_baselines.py
 .venv/bin/python tests/check_carbon_aware.py
 .venv/bin/python tests/check_job_prediction.py
+```
+
+The packages are importable because `pyproject.toml` declares them and the
+venv has them installed in place:
+
+```bash
+.venv/bin/pip install -e .
 ```
 
 The full 157,062-job trace takes roughly fourteen minutes for the four-policy

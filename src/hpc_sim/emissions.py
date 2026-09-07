@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping
 from carbon_accounting import PowerModel, account_emissions
 from carbon_intensity import CarbonIntensityProvider
 
-from .models import Job, JobRecord, SimulationResult
+from .models import Job, SimulationResult
 
 
 class CoverageError(ValueError):

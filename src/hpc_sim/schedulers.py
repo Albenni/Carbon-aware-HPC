@@ -18,13 +18,11 @@ class Scheduler(ABC):
     """A placement policy consulted whenever the simulation clock moves.
 
     The simulator owns the clock, the queue, and the node budget; a scheduler
-    only answers "which of these eligible jobs start now?". It may register
-    interest in carbon-intensity boundaries and may ask for a wakeup through
-    :meth:`Simulator.request_wakeup`.
+    only answers "which of these eligible jobs start now?". It may ask to be
+    consulted again through :meth:`Simulator.request_wakeup`.
     """
 
     name: str = "scheduler"
-    wants_carbon_intensity_events: bool = False
 
     @abstractmethod
     def select(
@@ -42,9 +40,6 @@ class Scheduler(ABC):
 
     def on_release(self, job: Job, now: datetime, simulator: Simulator) -> None:
         """Called as a job becomes eligible, before it enters the queue."""
-
-    def on_carbon_intensity_change(self, now: datetime, simulator: Simulator) -> None:
-        """Called at a carbon-intensity bucket boundary, if opted in."""
 
 
 class FCFSScheduler(Scheduler):

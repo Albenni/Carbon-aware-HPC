@@ -11,14 +11,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
 import time
 
 import pandas as pd
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from job_prediction import (
     AVERAGE_POWER_WATTS,
@@ -37,6 +33,7 @@ from job_prediction.experiment import (
     score_candidate,
 )
 from job_prediction.features import FeatureSpec, build_features
+from common import PROJECT_ROOT
 
 
 DEFAULT_WORKLOAD = PROJECT_ROOT / "data" / "processed" / "pm100_clean.parquet"

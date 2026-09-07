@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
-import sys
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from common import (
+    DEFAULT_CARBON_CACHE,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_WORKLOAD,
+    display_path,
+    parse_timestamp,
+)
 
 from carbon_intensity import CarbonIntensityProvider, TimeSeriesCarbonIntensityProvider
+from carbon_intensity.scheduling_impact import archive_reach
+from carbon_intensity.snapshots import ArchiveCarbonIntensityProvider, ForecastArchive
 from hpc_sim import (
     PM100_PARTITION_1_NODES,
     CarbonAwareScheduler,
     Cluster,
-    DurationScaledCarbonAwareScheduler,
     EASYBackfillScheduler,
     FCFSScheduler,
     PowerCappedCarbonAwareScheduler,
@@ -34,26 +39,34 @@ from hpc_sim import (
 from hpc_sim.workload import load_jobs
 
 
-DEFAULT_WORKLOAD = PROJECT_ROOT / "data" / "processed" / "pm100_debug_5000.parquet"
-DEFAULT_CARBON_CACHE = (
-    PROJECT_ROOT
-    / "data"
-    / "carbon_intensity"
-    / "electricity_maps_it_no_04_to_11_2020.json"
-)
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "simulations"
+#: Which of the three carbon-aware axes each policy name turns on. A forecast
+#: policy also takes the archive's reach as its bound, which it needs anyway.
+CARBON_POLICIES = {
+    "carbon": {},
+    "carbon-scaled-delay": {"scaled": True},
+    "carbon-power-cap": {"capped": True},
+    "carbon-forecast": {"forecast": True},
+    "carbon-forecast-scaled-delay": {"forecast": True, "scaled": True},
+}
 
-SCHEDULER_NAMES = (
-    "fcfs",
-    "easy",
-    "power-cap",
-    "carbon",
-    "carbon-scaled-delay",
-    "carbon-power-cap",
-    "replay",
-)
+
+SCHEDULER_NAMES = ("fcfs", "easy", "power-cap", *CARBON_POLICIES, "replay")
 
 WATTS_PER_MEGAWATT = 1e6
+
+
+def load_forecast_archive(arguments: argparse.Namespace) -> ForecastArchive:
+    """Read the archive a forecast policy replays.
+
+    The archive also bounds the delay budget: scoring a start time needs the
+    signal to the end of the job, and a 24-hour trajectory issued hourly
+    guarantees only 23 of them to a decision taken anywhere in the issue
+    interval. Accounting stays on the actual provider either way.
+    """
+
+    if arguments.forecast_archive is None:
+        raise SystemExit(f"--forecast-archive is required for {arguments.scheduler}")
+    return ForecastArchive.load(arguments.forecast_archive)
 
 
 def build_scheduler(
@@ -77,50 +90,38 @@ def build_scheduler(
     if arguments.scheduler == "easy":
         return EASYBackfillScheduler(runtime_estimate=estimate)
     if arguments.scheduler == "power-cap":
-        if arguments.power_cap_mw is None:
-            raise SystemExit("--power-cap-mw is required for the power-cap scheduler")
         return PowerCappedEASYScheduler(
-            arguments.power_cap_mw * WATTS_PER_MEGAWATT,
-            runtime_estimate=estimate,
+            power_cap_watts(arguments), runtime_estimate=estimate
         )
-    if arguments.scheduler in {"carbon", "carbon-scaled-delay", "carbon-power-cap"}:
-        options = {
-            "decision_granularity": (
-                timedelta(minutes=arguments.decision_granularity_minutes)
-                if arguments.decision_granularity_minutes is not None
-                else None
-            ),
-            "runtime_estimate": estimate,
-        }
-        if arguments.scheduler == "carbon-scaled-delay":
-            return DurationScaledCarbonAwareScheduler(
-                provider,
-                max_delay_fraction=arguments.max_delay_fraction,
-                **options,
-            )
+
+    axes = CARBON_POLICIES[arguments.scheduler]
+    options = {
+        "decision_granularity": (
+            timedelta(minutes=arguments.decision_granularity_minutes)
+            if arguments.decision_granularity_minutes is not None
+            else None
+        ),
+        "runtime_estimate": estimate,
+    }
+    if axes.get("scaled"):
+        options["max_delay_fraction"] = arguments.max_delay_fraction
+    else:
         options["max_delay"] = timedelta(hours=arguments.max_delay_hours)
-        if arguments.scheduler == "carbon":
-            return CarbonAwareScheduler(provider, **options)
-        if arguments.power_cap_mw is None:
-            raise SystemExit(
-                "--power-cap-mw is required for the carbon-power-cap scheduler"
-            )
+    if axes.get("forecast"):
+        archive = load_forecast_archive(arguments)
+        provider = ArchiveCarbonIntensityProvider(provider, archive)
+        options |= {"forecast": True, "reach": archive_reach(archive)}
+    if axes.get("capped"):
         return PowerCappedCarbonAwareScheduler(
-            provider,
-            arguments.power_cap_mw * WATTS_PER_MEGAWATT,
-            **options,
+            provider, power_cap_watts(arguments), **options
         )
-    raise SystemExit(f"unknown scheduler {arguments.scheduler}")
+    return CarbonAwareScheduler(provider, **options)
 
 
-def parse_timestamp(value: str) -> datetime:
-    try:
-        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(f"invalid ISO timestamp: {value}") from error
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    return timestamp
+def power_cap_watts(arguments: argparse.Namespace) -> float:
+    if arguments.power_cap_mw is None:
+        raise SystemExit(f"--power-cap-mw is required for {arguments.scheduler}")
+    return arguments.power_cap_mw * WATTS_PER_MEGAWATT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,8 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
             "carbon = EASY holding each job for its cleanest start within the "
             "fixed delay budget; carbon-scaled-delay = the same policy with a "
             "per-job budget proportional to duration; carbon-power-cap = the "
-            "fixed-delay policy under the aggregate power budget; replay = the "
-            "recorded schedule"
+            "fixed-delay policy under the aggregate power budget; "
+            "carbon-forecast = the fixed-delay policy reading only the "
+            "forecasts already issued at each decision; "
+            "carbon-forecast-scaled-delay = the same restriction with the "
+            "per-job budget; replay = the recorded schedule"
         ),
     )
     parser.add_argument(
@@ -195,6 +199,16 @@ def build_parser() -> argparse.ArgumentParser:
             "also select the workload cohort"
         ),
     )
+    parser.add_argument(
+        "--forecast-archive",
+        type=Path,
+        default=None,
+        help=(
+            "forecast archive from carbon_intensity.snapshots, required by the "
+            "carbon-forecast schedulers; pair it with the --carbon-cache it "
+            "was generated against (data/carbon_intensity/actual/actual.json)"
+        ),
+    )
     parser.add_argument("--carbon-cache", type=Path, default=DEFAULT_CARBON_CACHE)
     parser.add_argument(
         "--nodes",
@@ -223,16 +237,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the summary without writing a record table",
     )
     return parser
-
-
-def display_path(path: Path) -> str:
-    """Shorten a path against the project root when it lies inside it."""
-
-    resolved = path.resolve()
-    try:
-        return str(resolved.relative_to(PROJECT_ROOT))
-    except ValueError:
-        return str(resolved)
 
 
 def default_output_path(scheduler_name: str, job_count: int, nodes: int) -> Path:
@@ -355,6 +359,8 @@ def main() -> int:
     print_summary(result)
     if arguments.job_predictions is not None:
         print(f"job predictions          {display_path(arguments.job_predictions)}")
+    if arguments.forecast_archive is not None:
+        print(f"forecast archive         {display_path(arguments.forecast_archive)}")
 
     if not arguments.no_output:
         scheduler_label = (

@@ -1,7 +1,18 @@
+"""What a carbon-intensity series is, and how a policy reads one.
+
+One module because they are one concept: a :class:`CarbonIntensitySample` is a
+bucket of the series, a :class:`CarbonIntensityForecast` is a trajectory of
+them, and :class:`TimeSeriesCarbonIntensityProvider` is the series itself with
+the lookups accounting and simulation need. Everything works on the same
+15-minute UTC grid, which is the resolution Electricity Maps publishes and the
+one the whole experiment is defined on.
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from math import isfinite
@@ -9,8 +20,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import MappingProxyType
 from typing import Any
-
-from .models import CarbonIntensityForecast, CarbonIntensitySample
 
 
 FIFTEEN_MINUTES = timedelta(minutes=15)
@@ -44,54 +53,56 @@ def bucket_start(
     timestamp: datetime,
     granularity: timedelta = FIFTEEN_MINUTES,
 ) -> datetime:
-    """Return the UTC start of the bucket containing ``timestamp``."""
+    """Return the UTC start of the bucket containing ``timestamp``.
 
-    timestamp_utc = aware_utc(timestamp)
-    _validate_granularity(granularity)
-    bucket_index = (timestamp_utc - _EPOCH) // granularity
-    return _EPOCH + bucket_index * granularity
+    The granularity is a parameter because a policy may decide on a coarser
+    grid than the series it reads; the series itself is always 15-minute.
+    """
 
-
-def _validate_granularity(granularity: timedelta) -> None:
-    if not isinstance(granularity, timedelta):
-        raise TypeError("granularity must be a timedelta")
     if granularity <= timedelta(0):
         raise ValueError("granularity must be greater than zero")
+    return _EPOCH + (aware_utc(timestamp) - _EPOCH) // granularity * granularity
 
 
-def _iso_utc(timestamp: datetime) -> str:
-    return aware_utc(timestamp).isoformat().replace("+00:00", "Z")
+@dataclass(frozen=True, slots=True)
+class CarbonIntensitySample:
+    """One actual carbon-intensity bucket, valid from ``timestamp`` onward."""
+
+    timestamp: datetime
+    intensity_gco2e_per_kwh: float
+    is_estimated: bool | None = None
+    estimation_method: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.intensity_gco2e_per_kwh, bool):
+            raise TypeError("intensity_gco2e_per_kwh must be a number")
+        intensity = float(self.intensity_gco2e_per_kwh)
+        if not isfinite(intensity):
+            raise ValueError("intensity_gco2e_per_kwh must be finite")
+        if intensity < 0.0:
+            raise ValueError("intensity_gco2e_per_kwh cannot be negative")
+        object.__setattr__(self, "timestamp", aware_utc(self.timestamp))
+        object.__setattr__(self, "intensity_gco2e_per_kwh", intensity)
 
 
-def _parse_timestamp(value: object) -> datetime:
-    if not isinstance(value, str):
-        raise TypeError("cached sample timestamp must be text")
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError(f"invalid cached timestamp: {value!r}") from error
+@dataclass(frozen=True, slots=True)
+class CarbonIntensityForecast:
+    """Forecast values together with the time at which they became available."""
 
+    issue_time: datetime
+    samples: tuple[CarbonIntensitySample, ...]
 
-def _validate_metadata_value(value: object, path: str = "metadata") -> None:
-    """Require metadata that round-trips through strict JSON unchanged."""
-
-    if value is None or isinstance(value, (bool, int, str)):
-        return
-    if isinstance(value, float):
-        if not isfinite(value):
-            raise TypeError(f"{path} cannot contain non-finite numbers")
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_metadata_value(item, f"{path}[{index}]")
-        return
-    if isinstance(value, dict):
-        if not all(isinstance(key, str) for key in value):
-            raise TypeError(f"{path} object keys must be text")
-        for key, item in value.items():
-            _validate_metadata_value(item, f"{path}.{key}")
-        return
-    raise TypeError(f"{path} must contain only JSON values")
+    def __post_init__(self) -> None:
+        samples = tuple(self.samples)
+        if not samples:
+            raise ValueError("a forecast must contain at least one sample")
+        if not all(isinstance(sample, CarbonIntensitySample) for sample in samples):
+            raise TypeError("forecast samples must be CarbonIntensitySample values")
+        samples = tuple(sorted(samples, key=lambda sample: sample.timestamp))
+        if len({sample.timestamp for sample in samples}) != len(samples):
+            raise ValueError("forecast samples cannot contain duplicate timestamps")
+        object.__setattr__(self, "issue_time", aware_utc(self.issue_time, "issue_time"))
+        object.__setattr__(self, "samples", samples)
 
 
 class CarbonIntensityProvider(ABC):
@@ -129,34 +140,30 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
     """In-memory, piecewise-constant actual carbon-intensity series.
 
     Input samples may be unordered, but every timestamp must lie exactly on the
-    configured UTC grid. Gaps remain gaps: lookups never interpolate, select a
+    15-minute UTC grid. Gaps remain gaps: lookups never interpolate, select a
     nearest value, or extrapolate beyond the available buckets.
     """
+
+    granularity = FIFTEEN_MINUTES
 
     def __init__(
         self,
         samples: Iterable[CarbonIntensitySample],
         *,
-        granularity: timedelta = FIFTEEN_MINUTES,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        _validate_granularity(granularity)
-        supplied_samples = tuple(samples)
-        if not supplied_samples:
+        supplied = tuple(samples)
+        if not supplied:
             raise ValueError("at least one carbon-intensity sample is required")
-        if not all(
-            isinstance(sample, CarbonIntensitySample) for sample in supplied_samples
-        ):
+        if not all(isinstance(sample, CarbonIntensitySample) for sample in supplied):
             raise TypeError("samples must contain CarbonIntensitySample values")
-        ordered_samples = tuple(
-            sorted(supplied_samples, key=lambda sample: sample.timestamp)
-        )
+        ordered = tuple(sorted(supplied, key=lambda sample: sample.timestamp))
 
         by_timestamp: dict[datetime, CarbonIntensitySample] = {}
-        for sample in ordered_samples:
-            if bucket_start(sample.timestamp, granularity) != sample.timestamp:
+        for sample in ordered:
+            if bucket_start(sample.timestamp) != sample.timestamp:
                 raise ValueError(
-                    "sample timestamps must align with the UTC granularity grid: "
+                    "sample timestamps must align with the 15-minute UTC grid: "
                     f"{sample.timestamp.isoformat()}"
                 )
             if sample.timestamp in by_timestamp:
@@ -165,30 +172,25 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
                 )
             by_timestamp[sample.timestamp] = sample
 
-        if metadata is None:
-            metadata_copy: dict[str, Any] = {}
-        elif isinstance(metadata, Mapping):
-            metadata_copy = dict(metadata)
-        else:
+        if metadata is not None and not isinstance(metadata, Mapping):
             raise TypeError("metadata must be a mapping")
-        _validate_metadata_value(metadata_copy)
+        supplied_metadata = dict(metadata or {})
         try:
+            # The round trip is the validation. Provenance has to survive the
+            # cache unchanged, so anything strict JSON refuses outright, and
+            # anything it silently rewrites - an integer key, a tuple - is
+            # rejected here rather than discovered as a difference on reload.
             metadata_json = json.dumps(
-                metadata_copy,
-                allow_nan=False,
-                sort_keys=True,
+                supplied_metadata, allow_nan=False, sort_keys=True
             )
-        except (TypeError, ValueError) as error:
-            raise TypeError("metadata must contain JSON-serializable values") from error
+            if json.loads(metadata_json) != supplied_metadata:
+                raise TypeError("metadata must round-trip through JSON unchanged")
+        except ValueError as error:
+            raise TypeError("metadata must contain JSON values") from error
 
-        self._granularity = granularity
-        self._samples = ordered_samples
+        self._samples = ordered
         self._by_timestamp = by_timestamp
         self._metadata_json = metadata_json
-
-    @property
-    def granularity(self) -> timedelta:
-        return self._granularity
 
     @property
     def samples(self) -> tuple[CarbonIntensitySample, ...]:
@@ -205,16 +207,15 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
 
     @property
     def coverage_end(self) -> datetime:
-        return self._samples[-1].timestamp + self._granularity
+        return self._samples[-1].timestamp + FIFTEEN_MINUTES
 
     def _sample_at(self, timestamp: datetime) -> CarbonIntensitySample:
-        bucket = bucket_start(timestamp, self._granularity)
+        bucket = bucket_start(timestamp)
         try:
             return self._by_timestamp[bucket]
         except KeyError as error:
             raise MissingCarbonIntensityError(
-                "no actual carbon intensity for UTC bucket "
-                f"{bucket.isoformat()}"
+                f"no actual carbon intensity for UTC bucket {bucket.isoformat()}"
             ) from error
 
     def get_actual(self, timestamp: datetime) -> float:
@@ -231,24 +232,29 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
             raise ValueError("end must be later than start")
 
         result: list[CarbonIntensitySample] = []
-        current = bucket_start(start_utc, self._granularity)
+        current = bucket_start(start_utc)
         while current < end_utc:
             result.append(self._sample_at(current))
-            current += self._granularity
+            current += FIFTEEN_MINUTES
         return tuple(result)
 
     def save(self, path: str | Path) -> Path:
-        """Persist samples and source metadata in a normalized JSON cache."""
+        """Persist samples and source metadata in a normalized JSON cache.
+
+        Written through a temporary file in the same directory and renamed, so
+        an interrupted run leaves the previous cache intact rather than a
+        half-written one that would fail validation on the next load.
+        """
 
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": _CACHE_SCHEMA_VERSION,
-            "granularity_seconds": self._granularity.total_seconds(),
+            "granularity_seconds": FIFTEEN_MINUTES.total_seconds(),
             "metadata": json.loads(self._metadata_json),
             "samples": [
                 {
-                    "timestamp": _iso_utc(sample.timestamp),
+                    "timestamp": sample.timestamp.isoformat().replace("+00:00", "Z"),
                     "intensity_gco2e_per_kwh": sample.intensity_gco2e_per_kwh,
                     "is_estimated": sample.is_estimated,
                     "estimation_method": sample.estimation_method,
@@ -266,16 +272,10 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
                 prefix=f".{destination.name}.",
                 suffix=".tmp",
                 delete=False,
-            ) as temporary_file:
-                temporary = Path(temporary_file.name)
-                json.dump(
-                    payload,
-                    temporary_file,
-                    allow_nan=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                temporary_file.write("\n")
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump(payload, stream, allow_nan=False, indent=2, sort_keys=True)
+                stream.write("\n")
             temporary.replace(destination)
         finally:
             if temporary is not None:
@@ -284,7 +284,11 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
 
     @classmethod
     def load(cls, path: str | Path) -> TimeSeriesCarbonIntensityProvider:
-        """Load a cache produced by :meth:`save` and validate it again."""
+        """Load a cache produced by :meth:`save` and validate it again.
+
+        The cache comes from disk rather than from this codebase, so its shape
+        is checked before anything is built from it.
+        """
 
         source = Path(path)
         try:
@@ -293,33 +297,17 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
             raise ValueError(f"invalid carbon-intensity cache: {source}") from error
         if not isinstance(payload, dict):
             raise ValueError("carbon-intensity cache root must be an object")
-        schema_version = payload.get("schema_version")
-        if type(schema_version) is not int or (  # bool is an int subclass
-            schema_version != _CACHE_SCHEMA_VERSION
-        ):
+        if payload.get("schema_version") is not _CACHE_SCHEMA_VERSION:
             raise ValueError("unsupported carbon-intensity cache schema")
-
         try:
-            raw_granularity = payload["granularity_seconds"]
+            if payload["granularity_seconds"] != FIFTEEN_MINUTES.total_seconds():
+                raise ValueError("carbon-intensity caches must use 15-minute buckets")
             raw_samples = payload["samples"]
             metadata = payload.get("metadata", {})
         except KeyError as error:
             raise ValueError("carbon-intensity cache metadata is invalid") from error
-        if isinstance(raw_granularity, bool) or not isinstance(
-            raw_granularity,
-            (int, float),
-        ):
-            raise ValueError("cached granularity must be a number")
-        if not isfinite(raw_granularity) or raw_granularity <= 0:
-            raise ValueError("cached granularity must be finite and positive")
-        try:
-            granularity = timedelta(seconds=raw_granularity)
-        except OverflowError as error:
-            raise ValueError("cached granularity is outside the supported range") from error
-        if not isinstance(raw_samples, list):
-            raise ValueError("cached samples must be a list")
-        if not isinstance(metadata, dict):
-            raise ValueError("cached metadata must be an object")
+        if not isinstance(raw_samples, list) or not isinstance(metadata, dict):
+            raise ValueError("cached samples must be a list and metadata an object")
 
         samples: list[CarbonIntensitySample] = []
         for raw_sample in raw_samples:
@@ -328,15 +316,15 @@ class TimeSeriesCarbonIntensityProvider(CarbonIntensityProvider):
             try:
                 samples.append(
                     CarbonIntensitySample(
-                        timestamp=_parse_timestamp(raw_sample["timestamp"]),
-                        intensity_gco2e_per_kwh=raw_sample[
-                            "intensity_gco2e_per_kwh"
-                        ],
+                        timestamp=datetime.fromisoformat(raw_sample["timestamp"]),
+                        intensity_gco2e_per_kwh=raw_sample["intensity_gco2e_per_kwh"],
                         is_estimated=raw_sample.get("is_estimated"),
                         estimation_method=raw_sample.get("estimation_method"),
                     )
                 )
             except KeyError as error:
                 raise ValueError("cached sample is missing a required field") from error
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"invalid cached sample: {raw_sample!r}") from error
 
-        return cls(samples, granularity=granularity, metadata=metadata)
+        return cls(samples, metadata=metadata)

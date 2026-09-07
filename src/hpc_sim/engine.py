@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 import heapq
 from itertools import count
@@ -13,17 +13,13 @@ from .models import Job, JobRecord, SimulationResult, seconds
 class EventKind(Enum):
     """Everything that can make the simulation clock move.
 
-    ``CARBON_INTENSITY_CHANGE`` is emitted only for a scheduler that opts in.
-    A carbon-blind policy such as FCFS never observes one, and the carbon-aware
-    oracle does not need one either: knowing the whole signal in advance, it
-    asks for a wakeup at exactly the instant it chose. The source stays wired up
-    for a policy whose view of the signal can change while a job waits, which is
-    what a forecast-driven one will be.
+    A carbon-aware policy needs no bucket-boundary event of its own: it knows
+    the signal it decides on, so it asks for a ``TIMER`` at exactly the instant
+    it chose instead of being woken at every boundary.
     """
 
     COMPLETION = "completion"
     RELEASE = "release"
-    CARBON_INTENSITY_CHANGE = "carbon_intensity_change"
     TIMER = "timer"
 
 
@@ -34,68 +30,36 @@ class SimulationError(RuntimeError):
 class PendingQueue:
     """Jobs that are eligible but not yet running, in ``(release, id)`` order.
 
-    Removal is lazy: entries are tombstoned and the backing list is compacted
-    once tombstones outnumber live entries. A strict FCFS policy only ever takes
-    a prefix, which the head pointer handles without any compaction at all.
+    A dict is the whole data structure: insertion order is queue order, and
+    removal is O(1) without leaving a hole behind, so there is nothing to
+    tombstone and nothing to compact.
     """
 
-    __slots__ = ("_entries", "_index", "_head", "_tombstones")
+    __slots__ = ("_jobs",)
 
     def __init__(self) -> None:
-        self._entries: list[Job | None] = []
-        self._index: dict[object, int] = {}
-        self._head = 0
-        self._tombstones = 0
+        self._jobs: dict[object, Job] = {}
 
     def extend(self, jobs: Iterable[Job]) -> None:
         """Append a batch released at the same instant, ordered by job id."""
 
         for job in sorted(jobs, key=lambda released: str(released.job_id)):
-            if job.job_id in self._index:
+            if job.job_id in self._jobs:
                 raise SimulationError(f"job {job.job_id} was released twice")
-            self._index[job.job_id] = len(self._entries)
-            self._entries.append(job)
+            self._jobs[job.job_id] = job
 
     def remove(self, job: Job) -> None:
-        position = self._index.pop(job.job_id, None)
-        if position is None:
+        if self._jobs.pop(job.job_id, None) is None:
             raise SimulationError(f"job {job.job_id} is not in the pending queue")
-        self._entries[position] = None
-        self._tombstones += 1
-        self._advance_head()
-        if self._tombstones > len(self._entries) // 2:
-            self._compact()
-
-    def _advance_head(self) -> None:
-        entries = self._entries
-        head = self._head
-        limit = len(entries)
-        while head < limit and entries[head] is None:
-            head += 1
-        self._head = head
-
-    def _compact(self) -> None:
-        live = [job for job in self._entries[self._head :] if job is not None]
-        self._entries = list(live)
-        self._index = {job.job_id: position for position, job in enumerate(live)}
-        self._head = 0
-        self._tombstones = 0
 
     def __iter__(self) -> Iterator[Job]:
-        for job in self._entries[self._head :]:
-            if job is not None:
-                yield job
+        return iter(self._jobs.values())
 
     def __len__(self) -> int:
-        return len(self._index)
-
-    def __bool__(self) -> bool:
-        return bool(self._index)
+        return len(self._jobs)
 
     def peek(self) -> Job | None:
-        for job in self:
-            return job
-        return None
+        return next(iter(self._jobs.values()), None)
 
 
 class Simulator:
@@ -112,8 +76,6 @@ class Simulator:
         jobs: Iterable[Job],
         cluster: Cluster,
         scheduler: "Scheduler",
-        *,
-        carbon_intensity_granularity: timedelta | None = None,
     ) -> None:
         from .schedulers import Scheduler  # imported late to avoid a cycle
 
@@ -131,20 +93,12 @@ class Simulator:
         self._scheduler = scheduler
         reject_oversized_jobs(self._jobs, cluster)
 
-        if carbon_intensity_granularity is not None:
-            if not isinstance(carbon_intensity_granularity, timedelta):
-                raise TypeError("carbon_intensity_granularity must be a timedelta")
-            if carbon_intensity_granularity <= timedelta(0):
-                raise ValueError("carbon_intensity_granularity must be positive")
-        self._carbon_granularity = carbon_intensity_granularity
-
         self._events: list[tuple[datetime, int, EventKind, object]] = []
         self._sequence = count()
         self._now: datetime | None = None
         self._queue = PendingQueue()
         self._running: dict[object, tuple[Job, datetime]] = {}
         self._records: list[JobRecord] = []
-        self._carbon_boundary_pending = False
 
     @property
     def now(self) -> datetime:
@@ -193,15 +147,11 @@ class Simulator:
             self._push(job.release_time, EventKind.RELEASE, job)
 
         first_event_time = self._events[0][0]
-        if self._scheduler.wants_carbon_intensity_events:
-            self._push_next_carbon_boundary(first_event_time)
-
         while self._events:
             now = self._events[0][0]
             self._advance_clock_to(now)
             self._drain_events_at(now)
             self._start_selected_jobs(now)
-            self._maybe_extend_carbon_boundaries(now)
 
         if self._queue:
             stalled = self._queue.peek()
@@ -245,9 +195,6 @@ class Simulator:
                 completions.append(payload)  # type: ignore[arg-type]
             elif kind is EventKind.RELEASE:
                 releases.append(payload)  # type: ignore[arg-type]
-            elif kind is EventKind.CARBON_INTENSITY_CHANGE:
-                self._carbon_boundary_pending = False
-                self._scheduler.on_carbon_intensity_change(now, self)
             # A TIMER only exists to bring us here; the scheduling pass follows.
 
         # Completions first: nodes freed at `now` must be reusable at `now`.
@@ -290,24 +237,3 @@ class Simulator:
                 EventKind.COMPLETION,
                 job,
             )
-
-    def _push_next_carbon_boundary(self, after: datetime) -> None:
-        from carbon_intensity import bucket_start
-
-        granularity = self._carbon_granularity
-        if granularity is None:
-            return
-        boundary = bucket_start(after, granularity) + granularity
-        self._push(boundary, EventKind.CARBON_INTENSITY_CHANGE)
-        self._carbon_boundary_pending = True
-
-    def _maybe_extend_carbon_boundaries(self, now: datetime) -> None:
-        """Keep emitting boundaries only while there is still work to schedule."""
-
-        if self._carbon_boundary_pending:
-            return
-        if not self._scheduler.wants_carbon_intensity_events:
-            return
-        if not self._queue and not self._running:
-            return  # nothing left to decide, so stop generating boundaries
-        self._push_next_carbon_boundary(now)

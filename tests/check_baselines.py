@@ -14,12 +14,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
-import sys
 import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from carbon_accounting import JobPowerProfile
 from carbon_intensity import TimeSeriesCarbonIntensityProvider

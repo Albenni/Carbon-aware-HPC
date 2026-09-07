@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
-from math import ceil, frexp, fsum, isclose, isfinite, ldexp
+from math import ceil, fsum, isclose, isfinite
 from typing import TypeAlias
 
 from .models import AccountingResult, JobPowerProfile, PowerModel
@@ -49,47 +49,12 @@ def _power_model(power_model: PowerModel | str) -> PowerModel:
 
 
 def _segment_energy_kwh(power_watts: float, duration_seconds: float) -> float:
-    energy_kwh = _multiply_then_divide(
-        power_watts,
-        duration_seconds,
-        WATT_SECONDS_PER_KILOWATT_HOUR,
-    )
+    """Whole-job energy in kWh, dividing first so the product cannot overflow."""
+
+    energy_kwh = power_watts / WATT_SECONDS_PER_KILOWATT_HOUR * duration_seconds
     if not isfinite(energy_kwh):
         raise OverflowError("calculated energy exceeds the supported numeric range")
     return energy_kwh
-
-
-def _multiply_then_divide(
-    first: float,
-    second: float,
-    divisor: float,
-) -> float:
-    """Evaluate ``first * second / divisor`` without avoidable range loss."""
-
-    if first == 0.0 or second == 0.0:
-        return 0.0
-
-    direct_product = first * second
-    if isfinite(direct_product) and direct_product != 0.0:
-        direct_result = direct_product / divisor
-        if isfinite(direct_result) and direct_result != 0.0:
-            return direct_result
-
-    first_mantissa, first_exponent = frexp(first)
-    second_mantissa, second_exponent = frexp(second)
-    divisor_mantissa, divisor_exponent = frexp(divisor)
-    scaled_mantissa = (
-        first_mantissa * second_mantissa / divisor_mantissa
-    )
-    try:
-        return ldexp(
-            scaled_mantissa,
-            first_exponent + second_exponent - divisor_exponent,
-        )
-    except OverflowError as error:
-        raise OverflowError(
-            "calculated value exceeds the supported numeric range"
-        ) from error
 
 
 def energy_from_constant_power(

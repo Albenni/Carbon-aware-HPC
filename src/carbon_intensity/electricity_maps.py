@@ -4,14 +4,16 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 import json
 from math import isfinite
+import os
+from pathlib import Path
 from typing import Any, TypeAlias
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .models import CarbonIntensitySample
-from .provider import (
+from .series import (
     FIFTEEN_MINUTES,
+    CarbonIntensitySample,
     TimeSeriesCarbonIntensityProvider,
     aware_utc,
     bucket_start,
@@ -27,6 +29,31 @@ MAX_REQUEST_SPAN = timedelta(days=2)
 
 JsonObject: TypeAlias = Mapping[str, Any]
 Transport: TypeAlias = Callable[[str, Mapping[str, str]], JsonObject]
+
+
+def read_api_key(env_file: Path, variable_name: str) -> str:
+    """The API token, from the environment or from a ``KEY=value`` env file.
+
+    Lives here rather than in a module of its own because it is the client's
+    credential and has no other caller. The token is read on each run and never
+    written into a cache, a manifest, or a saved provider.
+    """
+
+    value = os.environ.get(variable_name)
+    if not value and env_file.exists():
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip().removeprefix("export ").lstrip()
+            if line.startswith("#"):
+                continue
+            key, separator, candidate = line.partition("=")
+            if separator and key.strip() == variable_name:
+                value = candidate.strip().strip("'\"")
+                break
+    if not value:
+        raise RuntimeError(
+            f"set {variable_name} or add it to {env_file}; the token is never cached"
+        )
+    return value.strip()
 
 
 class ElectricityMapsError(RuntimeError):
@@ -113,6 +140,7 @@ def _parse_sample(
     raw_sample: object,
     expected_zone: str,
     expected_emission_factor_type: str,
+    expected_flow_traced: bool,
 ) -> CarbonIntensitySample:
     if not isinstance(raw_sample, dict):
         raise ElectricityMapsError("each API sample must be an object")
@@ -128,6 +156,10 @@ def _parse_sample(
         raise ElectricityMapsError(
             "Electricity Maps returned an unexpected emission-factor type"
         )
+    if raw_sample.get("temporalGranularity", TEMPORAL_GRANULARITY) != TEMPORAL_GRANULARITY:
+        raise ElectricityMapsError("API sample has an unexpected temporal granularity")
+    if raw_sample.get("flowTraced", expected_flow_traced) is not expected_flow_traced:
+        raise ElectricityMapsError("API sample has an unexpected flow-tracing method")
 
     if "carbonIntensity" in raw_sample:
         intensity = raw_sample["carbonIntensity"]
@@ -210,6 +242,7 @@ class ElectricityMapsClient:
         fetch_end = _ceil_bucket(requested_end)
         samples_by_time: dict[datetime, CarbonIntensitySample] = {}
         request_count = 0
+        duplicate_count = 0
 
         chunk_start = fetch_start
         while chunk_start < fetch_end:
@@ -227,6 +260,7 @@ class ElectricityMapsClient:
                 payload,
                 zone,
                 emission_factor_type,
+                flow_traced,
             ):
                 if not chunk_start <= sample.timestamp < chunk_end:
                     raise ElectricityMapsError(
@@ -243,6 +277,7 @@ class ElectricityMapsClient:
                         "API returned conflicting values for "
                         f"{sample.timestamp.isoformat()}"
                     )
+                duplicate_count += previous is not None
                 samples_by_time[sample.timestamp] = sample
             chunk_start = chunk_end
 
@@ -253,7 +288,6 @@ class ElectricityMapsClient:
         try:
             provider = TimeSeriesCarbonIntensityProvider(
                 samples_by_time.values(),
-                granularity=FIFTEEN_MINUTES,
                 metadata={
                     "source": "Electricity Maps API",
                     "api_version": "v4",
@@ -264,6 +298,7 @@ class ElectricityMapsClient:
                     "temporal_granularity": TEMPORAL_GRANULARITY,
                     "emission_factor_type": emission_factor_type,
                     "flow_traced": flow_traced,
+                    "flow_traced_provenance": "requested; checked when returned",
                     "estimated_values_included": include_estimated,
                     "requested_start": _iso_utc(requested_start),
                     "requested_end": _iso_utc(requested_end),
@@ -271,6 +306,7 @@ class ElectricityMapsClient:
                     "cache_end": _iso_utc(fetch_end),
                     "request_chunk_seconds": int(chunk_size.total_seconds()),
                     "request_count": request_count,
+                    "duplicate_sample_count": duplicate_count,
                     "fetched_at": _iso_utc(fetched_at),
                     "gap_policy": "error",
                 },
@@ -313,12 +349,15 @@ class ElectricityMapsClient:
         payload: JsonObject,
         expected_zone: str,
         expected_emission_factor_type: str,
+        expected_flow_traced: bool,
     ) -> tuple[CarbonIntensitySample, ...]:
         response_zone = payload.get("zone")
         if response_zone is not None and response_zone != expected_zone:
             raise ElectricityMapsError(
                 f"expected zone {expected_zone}, received {response_zone}"
             )
+        if payload.get("flowTraced", expected_flow_traced) is not expected_flow_traced:
+            raise ElectricityMapsError("API returned an unexpected flow-tracing method")
         response_granularity = payload.get("temporalGranularity")
         if response_granularity is not None and (
             response_granularity != TEMPORAL_GRANULARITY
@@ -345,6 +384,7 @@ class ElectricityMapsClient:
                 raw_sample,
                 expected_zone,
                 expected_emission_factor_type,
+                expected_flow_traced,
             )
             for raw_sample in raw_samples
         )

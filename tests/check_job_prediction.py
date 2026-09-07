@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sys
 import unittest
 
 import numpy as np
@@ -12,7 +11,6 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from carbon_accounting import JobPowerProfile
 from hpc_sim import (
@@ -30,7 +28,7 @@ from job_prediction import (
     temporal_split,
 )
 from job_prediction.experiment import rolling_folds
-from job_prediction.model import TargetConfig, fit_gradient_predictor
+from job_prediction.gradient import TargetConfig, fit_gradient_predictor
 from job_prediction.features import (
     FeatureSpec,
     build_features,

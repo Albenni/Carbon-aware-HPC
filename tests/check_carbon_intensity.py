@@ -15,8 +15,7 @@ from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))  # scripts/ is not a package
 
 from carbon_accounting import JobPowerProfile, account_emissions
 from carbon_intensity import (

@@ -5,12 +5,13 @@ back for a bounded amount of time, when should it run? Energy is invariant to
 the schedule (§2.3 of the model formalization), so the only lever is *when* the
 work meets the grid, and the only cost of pulling it is delay.
 
-Everything in this module assumes the actual future carbon intensity is
-readable at decision time. That makes it the benchmark of
-§2.7: it measures how much carbon is available
-to save before any forecast error is introduced. Swapping
-:class:`CarbonSignal` for one built on issued forecasts is the only change
-needed to move to the realistic setting.
+:class:`CarbonAwareScheduler` is that policy. Its ``forecast`` switch chooses
+between the oracle, which reads the actual future intensity at decision time
+and so measures how much carbon is available to save before any forecast error
+is introduced (§2.7), and the realistic counterpart, which runs the identical
+policy over the forecast the provider had already issued when each job was
+released. The difference between those two runs is attributable to forecast
+error and to nothing else.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from types import MappingProxyType
 from carbon_accounting import energy_from_constant_power
 from carbon_intensity import (
     CarbonIntensityProvider,
+    CarbonIntensitySample,
     MissingCarbonIntensityError,
     aware_utc,
     bucket_start,
@@ -31,6 +33,16 @@ from carbon_intensity import (
 from .engine import PendingQueue, Simulator
 from .models import Job, seconds
 from .schedulers import EASYBackfillScheduler, RuntimeEstimateSource, _PowerCapMixin
+
+
+def _policy_name(*, forecast: bool, scaled: bool, bounded: bool) -> str:
+    """The label a run is recorded under, from the three axes that define it."""
+
+    if scaled:
+        name = "carbon-forecast-scaled-delay" if forecast else "carbon-scaled-delay"
+    else:
+        name = "carbon-aware-forecast" if forecast else "carbon-aware"
+    return name + "-bounded" if bounded else name
 
 
 class CarbonSignal:
@@ -59,18 +71,53 @@ class CarbonSignal:
                 "coverage_start and coverage_end"
             )
 
-        samples = provider.get_actual_range(coverage_start, coverage_end)
-        step_seconds = provider.granularity.total_seconds()
-        intensity = tuple(sample.intensity_gco2e_per_kwh for sample in samples)
+        self._load(
+            provider.get_actual_range(coverage_start, coverage_end),
+            provider.granularity,
+        )
 
+    @classmethod
+    def from_samples(
+        cls,
+        samples: Iterable[CarbonIntensitySample],
+        granularity: timedelta,
+    ) -> "CarbonSignal":
+        """The same integral over an issued forecast rather than the actual series.
+
+        A forecast trajectory is contiguous on the provider's own grid, so
+        nothing here distinguishes it from an observed one: windows are scored
+        identically and only the values being read change.
+        """
+
+        signal = cls.__new__(cls)
+        signal._load(tuple(samples), granularity)
+        return signal
+
+    def _load(
+        self,
+        samples: tuple[CarbonIntensitySample, ...],
+        granularity: timedelta,
+    ) -> None:
+        if not samples:
+            raise ValueError("a carbon signal needs at least one bucket")
+        step_seconds = granularity.total_seconds()
+        start = aware_utc(samples[0].timestamp, "series start")
+
+        intensity: list[float] = []
         cumulative = [0.0]
-        for value in intensity:
-            cumulative.append(cumulative[-1] + value * step_seconds)
+        for index, sample in enumerate(samples):
+            if sample.timestamp != start + index * granularity:
+                raise ValueError(
+                    "a carbon signal needs a gap-free series on a single grid: "
+                    f"{sample.timestamp.isoformat()} breaks it"
+                )
+            intensity.append(sample.intensity_gco2e_per_kwh)
+            cumulative.append(cumulative[-1] + intensity[-1] * step_seconds)
 
-        self._start = aware_utc(coverage_start, "coverage_start")
-        self._end = self._start + timedelta(seconds=step_seconds * len(intensity))
+        self._start = start
+        self._end = start + timedelta(seconds=step_seconds * len(intensity))
         self._step_seconds = step_seconds
-        self._intensity = intensity
+        self._intensity = tuple(intensity)
         self._cumulative = tuple(cumulative)
 
     @property
@@ -167,13 +214,73 @@ def cheapest_start_time(
     )
 
 
-class _CarbonAwareScheduler(EASYBackfillScheduler):
-    """Target selection and queue handling shared by carbon-aware policies."""
+class CarbonAwareScheduler(EASYBackfillScheduler):
+    """EASY backfilling that holds each job for its cleanest start time.
+
+    When a job becomes eligible the policy scores every candidate start in its
+    delay budget and picks the cheapest. Until that instant the job is simply
+    not offered to the placement pass: it does not hold the head of the queue,
+    so the jobs behind it move up and the machine keeps working. From that
+    instant on it is an ordinary EASY candidate, back in its original queue
+    position, which is what bounds the harm - a job that yields its place is at
+    worst as delayed as the queue it re-enters.
+
+    Because the schedule cannot change the signal, and the signal cannot change
+    the job, the choice is fixed at release and never revisited. The policy asks
+    the simulator for a wakeup at exactly that instant instead of subscribing to
+    every bucket boundary, so the deferral costs one event per deferred job.
+
+    Being withheld rather than refused also keeps a held job out of every
+    reservation: EASY's promise is to the head of the *offered* queue, so a
+    backfilled job may still be running when a held job comes back.
+
+    A job without an accounting power profile is offered to EASY immediately.
+    It participates in queueing and node contention, but the policy neither
+    assigns it a carbon cost nor delays it for carbon reasons.
+
+    Three parameters, and nothing else, separate the policies this class covers.
+
+    ``max_delay`` or ``max_delay_fraction``
+        The delay budget, either a fixed window or a per-job one worth
+        ``scheduling_duration_seconds x max_delay_fraction``. Exactly one is
+        required. It is a budget on voluntary deferral, not a deadline: once a
+        target arrives the job competes for nodes like any other and contention
+        can still push it later. Zero of either reproduces EASY exactly, which
+        is what makes the trade-off sweep start from a known point. The
+        proportional form uses a duration prediction when one is present and
+        never reads the actual duration by accident.
+
+    ``forecast``
+        Where the signal comes from. ``False`` materialises the actual series
+        once and reads the future perfectly: the oracle of section 2.7, which
+        measures how much carbon is available to save before any forecast error
+        is introduced. ``True`` asks the provider, at each release, for the
+        forecast already issued at that instant, so every decision consumes
+        exactly what a scheduler running at the time could have read and the
+        actual series is never touched while deciding - the provider is free to
+        refuse it outright. The policy is otherwise identical, so the emissions
+        gap between the two runs is attributable to forecast error alone.
+
+    ``reach``
+        How far ahead any decision may look, when the signal is finite. Scoring
+        a start needs the signal to the end of the job, so a job of duration
+        ``d`` may only move within ``reach - d``; past that a forecast archive
+        has nothing to offer and the provider rightly refuses. The oracle takes
+        the same bound as its forecast counterpart even though it could read as
+        far as it likes, otherwise the two runs would differ in delay budget as
+        well as in signal. The bound bites hardest under a proportional budget,
+        where the jobs earning the largest windows are the ones the horizon can
+        least afford.
+    """
 
     def __init__(
         self,
         provider: CarbonIntensityProvider,
         *,
+        max_delay: timedelta | None = None,
+        max_delay_fraction: float | None = None,
+        reach: timedelta | None = None,
+        forecast: bool = False,
         decision_granularity: timedelta | None = None,
         runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
         backfill_window: int | None = None,
@@ -182,17 +289,39 @@ class _CarbonAwareScheduler(EASYBackfillScheduler):
             runtime_estimate=runtime_estimate,
             backfill_window=backfill_window,
         )
+        if (max_delay is None) == (max_delay_fraction is None):
+            raise ValueError("give exactly one of max_delay or max_delay_fraction")
+        if max_delay is not None and max_delay < timedelta(0):
+            raise ValueError("max_delay cannot be negative")
+        if max_delay_fraction is not None:
+            max_delay_fraction = float(max_delay_fraction)
+            if not isfinite(max_delay_fraction) or max_delay_fraction < 0.0:
+                raise ValueError("max_delay_fraction must be finite and non-negative")
+
         granularity = (
             provider.granularity if decision_granularity is None else decision_granularity
         )
-        if not isinstance(granularity, timedelta):
-            raise TypeError("decision_granularity must be a timedelta")
         if granularity <= timedelta(0):
             raise ValueError("decision_granularity must be greater than zero")
 
-        self._signal = CarbonSignal(provider)
+        self.name = _policy_name(
+            forecast=forecast, scaled=max_delay_fraction is not None, bounded=reach is not None
+        )
+        self._provider = provider
+        self._forecast = forecast
+        self._max_delay = max_delay
+        self._max_delay_fraction = max_delay_fraction
+        self._reach = reach
+        self._signal = None if forecast else CarbonSignal(provider)
         self._granularity = granularity
         self._targets: dict[object, datetime] = {}
+        self._issue_times: dict[object, datetime] = {}
+
+    @property
+    def reads_actual_series(self) -> bool:
+        """Whether the policy may materialise the whole actual series up front."""
+
+        return not self._forecast
 
     @property
     def target_start_times(self) -> Mapping[object, datetime]:
@@ -200,17 +329,55 @@ class _CarbonAwareScheduler(EASYBackfillScheduler):
 
         return MappingProxyType(self._targets)
 
+    @property
+    def forecast_issue_times(self) -> Mapping[object, datetime]:
+        """Which issued forecast each decision read.
+
+        Empty for an oracle, which reads none, and for jobs decided without
+        consulting the signal at all.
+        """
+
+        return MappingProxyType(self._issue_times)
+
     def _max_delay_for(self, job: Job) -> timedelta:
-        raise NotImplementedError
+        if self._max_delay is not None:
+            budget = self._max_delay
+        else:
+            try:
+                budget = seconds(
+                    job.scheduling_duration_seconds * self._max_delay_fraction
+                )
+            except OverflowError as error:
+                raise ValueError(
+                    f"scaled delay for job {job.job_id} is too large"
+                ) from error
+        if self._reach is None:
+            return budget
+        runtime = seconds(job.scheduling_duration_seconds)
+        return min(budget, max(self._reach - runtime, timedelta(0)))
+
+    def _signal_for(self, job: Job, now: datetime) -> CarbonSignal:
+        """The signal this decision is scored against."""
+
+        if not self._forecast:
+            return self._signal
+        horizon = self._max_delay_for(job) + seconds(job.scheduling_duration_seconds)
+        issued = self._provider.get_forecast(now, horizon)
+        self._issue_times[job.job_id] = issued.issue_time
+        return CarbonSignal.from_samples(issued.samples, self._provider.granularity)
 
     def on_release(self, job: Job, now: datetime, simulator: Simulator) -> None:
+        # An unscored job, or one with no delay budget, has a single admissible
+        # start, so the signal is never consulted: that is what keeps a zero
+        # budget identical to plain EASY whatever the signal could have said.
+        budget = timedelta(0) if job.power is None else self._max_delay_for(job)
         target = (
             job.release_time
-            if job.power is None
+            if budget <= timedelta(0)
             else cheapest_start_time(
                 job,
-                self._signal,
-                max_delay=self._max_delay_for(job),
+                self._signal_for(job, now),
+                max_delay=budget,
                 granularity=self._granularity,
             )
         )
@@ -228,116 +395,6 @@ class _CarbonAwareScheduler(EASYBackfillScheduler):
         return (job for job in queue if self._targets[job.job_id] <= now)
 
 
-class CarbonAwareScheduler(_CarbonAwareScheduler):
-    """EASY backfilling that holds each job for its cleanest start time.
-
-    When a job becomes eligible the policy scores every candidate start in
-    ``[release, release + max_delay]`` and picks the cheapest. Until that
-    instant the job is simply not offered to the placement pass: it does not
-    hold the head of the queue, so the jobs behind it move up and the machine
-    keeps working. From that instant on it is an ordinary EASY candidate, back
-    in its original queue position, which is what bounds the harm — a job that
-    yields its place is at worst as delayed as the queue it re-enters.
-
-    Because the schedule cannot change the signal, and the signal cannot change
-    the job, the choice is fixed at release and never revisited. The policy asks
-    the simulator for a wakeup at exactly that instant instead of subscribing to
-    every bucket boundary, so the deferral costs one event per deferred job.
-
-    Being withheld rather than refused also keeps a held job out of every
-    reservation: EASY's promise is to the head of the *offered* queue, so a
-    backfilled job may still be running when a held job comes back.
-
-    ``max_delay`` is a budget on voluntary deferral, not a deadline. Once its
-    target arrives, a job competes for nodes like any other and contention can
-    still push it later; the delay attributable to the carbon decision is the
-    part this parameter bounds. ``max_delay=0`` reproduces EASY exactly, which
-    is what makes the trade-off sweep start from a known point.
-
-    A job without an accounting power profile is offered to EASY immediately.
-    It participates in queueing and node contention, but the policy neither
-    assigns it a carbon cost nor delays it for carbon reasons.
-    """
-
-    name = "carbon-aware"
-
-    def __init__(
-        self,
-        provider: CarbonIntensityProvider,
-        *,
-        max_delay: timedelta,
-        decision_granularity: timedelta | None = None,
-        runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
-        backfill_window: int | None = None,
-    ) -> None:
-        if not isinstance(max_delay, timedelta):
-            raise TypeError("max_delay must be a timedelta")
-        if max_delay < timedelta(0):
-            raise ValueError("max_delay cannot be negative")
-        self._max_delay = max_delay
-        super().__init__(
-            provider,
-            decision_granularity=decision_granularity,
-            runtime_estimate=runtime_estimate,
-            backfill_window=backfill_window,
-        )
-
-    @property
-    def max_delay(self) -> timedelta:
-        return self._max_delay
-
-    def _max_delay_for(self, job: Job) -> timedelta:
-        del job
-        return self._max_delay
-
-
-class DurationScaledCarbonAwareScheduler(_CarbonAwareScheduler):
-    """Carbon-aware EASY with a delay budget proportional to each job.
-
-    The per-job budget is ``scheduling_duration_seconds × max_delay_fraction``.
-    It therefore uses a duration prediction when present and never reads the
-    actual duration by accident. A fraction of ``1.0`` allows voluntary delay
-    up to 100% of the estimated runtime; zero reproduces EASY.
-    """
-
-    name = "carbon-scaled-delay"
-
-    def __init__(
-        self,
-        provider: CarbonIntensityProvider,
-        *,
-        max_delay_fraction: float = 1.0,
-        decision_granularity: timedelta | None = None,
-        runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
-        backfill_window: int | None = None,
-    ) -> None:
-        if isinstance(max_delay_fraction, bool):
-            raise TypeError("max_delay_fraction must be a number, not a boolean")
-        try:
-            fraction = float(max_delay_fraction)
-        except (TypeError, ValueError) as error:
-            raise TypeError("max_delay_fraction must be a real number") from error
-        if not isfinite(fraction) or fraction < 0.0:
-            raise ValueError("max_delay_fraction must be finite and non-negative")
-        self._max_delay_fraction = fraction
-        super().__init__(
-            provider,
-            decision_granularity=decision_granularity,
-            runtime_estimate=runtime_estimate,
-            backfill_window=backfill_window,
-        )
-
-    @property
-    def max_delay_fraction(self) -> float:
-        return self._max_delay_fraction
-
-    def _max_delay_for(self, job: Job) -> timedelta:
-        try:
-            return seconds(job.scheduling_duration_seconds * self._max_delay_fraction)
-        except OverflowError as error:
-            raise ValueError(f"scaled delay for job {job.job_id} is too large") from error
-
-
 class PowerCappedCarbonAwareScheduler(_PowerCapMixin, CarbonAwareScheduler):
     """Carbon-aware EASY constrained by an aggregate power budget.
 
@@ -348,23 +405,12 @@ class PowerCappedCarbonAwareScheduler(_PowerCapMixin, CarbonAwareScheduler):
     :class:`~hpc_sim.schedulers.PowerCappedEASYScheduler`.
     """
 
-    name = "carbon-power-cap"
-
     def __init__(
         self,
         provider: CarbonIntensityProvider,
         power_cap_watts: float,
-        *,
-        max_delay: timedelta,
-        decision_granularity: timedelta | None = None,
-        runtime_estimate: RuntimeEstimateSource = RuntimeEstimateSource.SCHEDULING,
-        backfill_window: int | None = None,
+        **keywords,
     ) -> None:
         self._set_power_cap(power_cap_watts)
-        super().__init__(
-            provider,
-            max_delay=max_delay,
-            decision_granularity=decision_granularity,
-            runtime_estimate=runtime_estimate,
-            backfill_window=backfill_window,
-        )
+        super().__init__(provider, **keywords)
+        self.name = "carbon-power-cap"

@@ -4,12 +4,10 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from math import isclose
 from pathlib import Path
-import sys
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
-sys.path.insert(0, str(SRC_DIR))
 
 from carbon_accounting import (
     JobPowerProfile,

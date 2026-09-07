@@ -21,11 +21,7 @@ import argparse
 import csv
 from datetime import timedelta
 from pathlib import Path
-import sys
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from carbon_intensity import TimeSeriesCarbonIntensityProvider
 from hpc_sim import (
@@ -42,7 +38,7 @@ from hpc_sim import (
 )
 from hpc_sim.workload import load_contention_jobs, load_jobs
 
-from run_simulation import (
+from common import (
     DEFAULT_CARBON_CACHE,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_WORKLOAD,

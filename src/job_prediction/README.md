@@ -418,8 +418,8 @@ Run the held-out cohort with predicted scheduling inputs:
 Measure the scheduling impact of each model, then put them side by side:
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m job_prediction.scheduling_impact
-PYTHONPATH=src .venv/bin/python -m job_prediction.scheduling_impact \
+.venv/bin/python -m job_prediction.scheduling_impact
+.venv/bin/python -m job_prediction.scheduling_impact \
   --predictions data/job_predictions/ridge_baseline/test_predictions.parquet \
   --output-dir data/job_predictions/ridge_baseline
 .venv/bin/python scripts/compare_job_prediction_impact.py

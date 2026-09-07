@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carbon-aware-hpc"
+version = "0.1.0"
+description = "Carbon-aware scheduling experiments on the PM100 trace"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "scikit-learn>=1.4",
+]
+
+# An editable install is what puts src/ on the path, replacing the
+# sys.path.insert preamble every script and test used to repeat.
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = [
+    "carbon_accounting",
+    "carbon_intensity",
+    "hpc_sim",
+    "job_prediction",
+]

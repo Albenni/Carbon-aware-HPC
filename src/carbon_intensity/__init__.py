@@ -1,15 +1,13 @@
 """Source-independent actual and forecast carbon-intensity interfaces."""
 
-from .electricity_maps import (
-    DEFAULT_ZONE,
-    ElectricityMapsClient,
-    ElectricityMapsError,
-)
-from .models import CarbonIntensityForecast, CarbonIntensitySample
-from .provider import (
+from .baselines import BaselineCarbonIntensityProvider
+from .electricity_maps import DEFAULT_ZONE, ElectricityMapsClient, ElectricityMapsError
+from .protocol import TemporalProtocol
+from .series import (
     FIFTEEN_MINUTES,
-    CarbonIntensityError,
+    CarbonIntensityForecast,
     CarbonIntensityProvider,
+    CarbonIntensitySample,
     ForecastUnavailableError,
     MissingCarbonIntensityError,
     TimeSeriesCarbonIntensityProvider,
@@ -20,7 +18,7 @@ from .provider import (
 __all__ = [
     "DEFAULT_ZONE",
     "FIFTEEN_MINUTES",
-    "CarbonIntensityError",
+    "BaselineCarbonIntensityProvider",
     "CarbonIntensityForecast",
     "CarbonIntensityProvider",
     "CarbonIntensitySample",
@@ -28,6 +26,7 @@ __all__ = [
     "ElectricityMapsError",
     "ForecastUnavailableError",
     "MissingCarbonIntensityError",
+    "TemporalProtocol",
     "TimeSeriesCarbonIntensityProvider",
     "aware_utc",
     "bucket_start",
