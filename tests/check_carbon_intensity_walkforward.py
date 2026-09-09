@@ -1,14 +1,14 @@
-"""Small offline check: python -m carbon_intensity.check_walkforward."""
+"""Small offline check: python tests/check_carbon_intensity_walkforward.py."""
 
 from datetime import datetime, timedelta, timezone
 
-from .check_history import rejects
-from .forecasting import BUCKETS, HORIZON
-from .series import CarbonIntensitySample as Sample
-from .protocol import TemporalProtocol
-from .series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
-from .snapshots import ForecastArchive
-from .walkforward import WalkForwardForecaster, pooled_design, refit_cutoffs
+from check_carbon_intensity_history import rejects
+from carbon_intensity.forecasting import BUCKETS, HORIZON
+from carbon_intensity.series import CarbonIntensitySample as Sample
+from carbon_intensity.protocol import TemporalProtocol
+from carbon_intensity.series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
+from carbon_intensity.snapshots import ForecastArchive
+from carbon_intensity.walkforward import WalkForwardForecaster, pooled_design, refit_cutoffs
 
 
 def main():

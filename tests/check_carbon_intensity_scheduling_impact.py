@@ -1,4 +1,4 @@
-"""Small offline check: python -m carbon_intensity.check_scheduling_impact."""
+"""Small offline check: python tests/check_carbon_intensity_scheduling_impact.py."""
 
 from datetime import datetime, timedelta, timezone
 
@@ -6,10 +6,10 @@ from carbon_accounting import JobPowerProfile
 from hpc_sim import CarbonAwareScheduler
 from hpc_sim.models import Job
 
-from .series import CarbonIntensityForecast, CarbonIntensitySample as Sample
-from .series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
-from .scheduling_impact import archive_reach, compare
-from .snapshots import ArchiveCarbonIntensityProvider, ForecastArchive
+from carbon_intensity.series import CarbonIntensityForecast, CarbonIntensitySample as Sample
+from carbon_intensity.series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
+from carbon_intensity.scheduling_impact import archive_reach, compare
+from carbon_intensity.snapshots import ArchiveCarbonIntensityProvider, ForecastArchive
 
 
 BASE = datetime(2020, 5, 6, tzinfo=timezone.utc)
@@ -91,7 +91,7 @@ def main() -> None:
     assert rows["carbon_forecast_flat"]["oracle_recovery"] == 0.0
     assert rows["carbon_forecast_flat"]["start_changed_fraction"] > 0.0
 
-    print("carbon_intensity.check_scheduling_impact: OK")
+    print("Forecast-driven scheduling impact checks passed.")
 
 
 if __name__ == "__main__":

@@ -1,51 +1,46 @@
 # Discrete-event HPC simulator
 
-This package decides _when_ jobs run under a finite node budget, and records
-what that costs in time, energy, and carbon. It is the component that turns
-`CO2(job, start_time)` from a formula into an experiment.
+This package simulates when HPC jobs run under a finite node budget and measures the resulting time, energy, and carbon costs.
 
-It reuses `carbon_accounting` for every energy and emission figure and
-`carbon_intensity` for every grid signal; it adds no physics of its own.
+Scheduling is separate from accounting: all energy and emission calculations come from `carbon_accounting`, and all grid signals come from `carbon_intensity`.
 
 ## Event model
 
-Continuous timestamps, no fixed tick. The clock jumps between event instants:
+The simulator uses continuous timestamps rather than fixed ticks.
 
-| Event                     | Meaning                                                       |
-| ------------------------- | ------------------------------------------------------------- |
-| `RELEASE`                 | a job becomes eligible (`release_time`, i.e. `eligible_time`) |
-| `COMPLETION`              | a running job ends and returns its nodes                      |
-| `CARBON_INTENSITY_CHANGE` | a grid signal bucket boundary                                 |
-| `TIMER`                   | a wakeup a scheduler asked for                                |
+| Event                     | Meaning                                   |
+| ------------------------- | ----------------------------------------- |
+| `RELEASE`                 | a job becomes eligible at `release_time`  |
+| `COMPLETION`              | a running job ends and releases its nodes |
+| `CARBON_INTENSITY_CHANGE` | a grid-signal boundary                    |
+| `TIMER`                   | a scheduler-requested wakeup              |
 
-Every event sharing an instant is drained before the scheduler is consulted, and
-completions are applied before releases. Nodes freed at `t` are therefore
-available to a job starting at `t`, with no ordering subtlety between the two
-events. Ties are broken by a monotonic sequence counter, so a run is fully
-deterministic.
+All events at the same timestamp are processed before scheduling. Completions are applied before releases, so nodes released at `t` can be reused immediately at `t`.
 
-There is no bucket-boundary event. A carbon-aware policy decides once, at
-release, against a signal it already knows, so it asks for a `TIMER` at exactly
-the instant it chose rather than being woken at every boundary: the deferral
-costs one event per deferred job instead of one per bucket.
+Ties are resolved by a monotonic sequence counter, making runs deterministic.
+
+Carbon-aware policies normally decide once at release and request a `TIMER` for the selected start rather than waking at every carbon bucket. A deferred job therefore adds one event, not one event per bucket.
 
 ## Resources
 
-The model formalization treats the nodes of a partition as equivalent, so
-`Cluster` tracks a **count**, not identities. The `nodes` id-list column of the
-trace stays validation only.
+`Cluster` models equivalent nodes by count rather than identity. Trace node IDs are used for validation only.
 
-Capacity defaults to **880 nodes** (`PM100_PARTITION_1_NODES`): the distinct node
-ids observed in partition 1 across the raw `COMPLETED` PM100 jobs (ids 20–979).
-Observed peak concurrency is lower — 787 in the raw trace, 774 after the dataset
-power profile cleaning — so those are lower bounds on the machine rather than its
-capacity. All three are worth sweeping in a sensitivity analysis.
+Default capacity is **880 nodes** (`PM100_PARTITION_1_NODES`), corresponding to the distinct node IDs observed in PM100 partition 1.
 
-Every allocation and release is checked against `0 <= busy <= total` and raises
-`CapacityError` on violation instead of clamping: silently over committing would
-invalidate every downstream emission figure. A job larger than the whole cluster
-is rejected when the `Simulator` is constructed, because it would stall a strict
-FCFS queue forever.
+Observed peak occupancy is lower:
+
+- raw completed trace: 787 nodes;
+- cleaned power-profile dataset: 774 nodes.
+
+These are lower bounds on capacity and useful sensitivity-analysis values.
+
+All allocations enforce:
+
+```text
+0 <= busy <= total
+```
+
+Violations raise `CapacityError`. Jobs larger than the cluster are rejected when the `Simulator` is constructed.
 
 ## Schedulers
 
@@ -57,273 +52,233 @@ class Scheduler(ABC):
     def on_release(self, job, now, simulator) -> None: ...
 ```
 
-- **`FCFSScheduler`** considers jobs in `(release_time, job_id)` order and stops
-  at the first that does not fit. That halt _is_ strict FCFS: a small job never
-  overtakes a blocked large one, even when idle nodes could hold it.
-- **`EASYBackfillScheduler`** relaxes exactly that rule, under a reservation.
-  The first job that does not fit becomes the **pivot** and is promised the
-  earliest instant at which enough nodes are projected to free up. Jobs further
-  back may then overtake it, but only if they provably cannot push that
-  reservation later — each either ends before the reservation, or takes only
-  nodes the pivot will not need at it. The single reservation is what keeps the
-  head of the queue from starving.
-- **`PowerCappedEASYScheduler`** is the energy aware baseline: EASY plus an
-  aggregate power budget. See below for why the budget is on power and not on
-  energy.
-- **`CarbonAwareScheduler`** is EASY plus one carbon decision per job: hold it
-  until the cleanest start time within its delay budget. Three keyword
-  arguments, and nothing else, separate the policies it implements:
-  - `max_delay` **or** `max_delay_fraction` — a fixed delay budget, or a per-job
-    one proportional to the duration available to the scheduler.
-  - `forecast=True` — decide against the forecast already issued at release
-    rather than against the observations, so a run differs from its oracle in
-    the signal and in nothing else.
-  - `reach` — cap the budget at what a finite forecast can cover. The oracle
-    takes the same cap as its forecast counterpart, otherwise the two would
-    differ in budget as well as in signal.
+### FCFS
 
-  It reports itself under the name that combination earns (`carbon-aware`,
-  `carbon-scaled-delay`, `carbon-aware-forecast`,
-  `carbon-forecast-scaled-delay`, each optionally `-bounded`), so the tables
-  read as before.
-- **`PowerCappedCarbonAwareScheduler`** makes the same carbon decision, then
-  admits ready jobs only while aggregate scheduled power remains under the cap.
-- **`TraceReplayScheduler`** starts each job at its recorded `start_time`. It is
-  the validation policy rather than a policy under study — see below.
+`FCFSScheduler` considers jobs in `(release_time, job_id)` order and stops at the first job that does not fit. Smaller jobs never overtake a blocked head job.
 
-A scheduler may call `simulator.request_wakeup(when)` to be consulted again
-later. A wakeup in the past raises, because that is a policy bug rather than a
-rounding artefact. EASY needs no wakeup: it recomputes the reservation on every
-pass, and a completion — the only event that can bring one forward — already
-triggers a pass. The carbon-aware policy asks for exactly one, at the instant it
-chose for the job.
+### EASY backfilling
 
-### What a policy is allowed to know
+`EASYBackfillScheduler` reserves capacity for the first queued job that cannot start, the **pivot**.
 
-Backfilling has to guess when running jobs end, and which guess it may use is a
-statement about information, not an implementation detail. `RuntimeEstimateSource`
-makes it explicit:
+Later jobs may backfill only if they cannot delay the pivot's reservation. A backfill is safe when it either:
 
-| Source       | Estimate                          | Use                                                               |
-| ------------ | --------------------------------- | ----------------------------------------------------------------- |
-| `TIME_LIMIT` | the walltime the user requested   | classic EASY; the only estimate genuinely available at submission |
-| `SCHEDULING` | `Job.scheduling_duration_seconds` | a prediction once one exists, the actual duration until then      |
+- completes before the reservation; or
+- uses only capacity the pivot will not require at the reservation.
 
-PM100 users overshoot heavily — the median job runs for **2.5%** of its
-requested walltime — so classic reservations sit far in the future and suppress
-backfills that perfect information would allow. `SCHEDULING` is the setting that
-puts the baselines on the same footing as the carbon-aware policies,
-which is what "the same information for every scheduler compared" requires.
+Only the pivot is reserved, preventing starvation of the queue head.
 
-Power is read through the matching seam, `Job.scheduling_average_power_watts`,
-so no policy ever touches a measured profile.
+### Power-capped EASY
 
-The submission-time models in `src/job_prediction/` populate both seams from a
-prediction only parquet artifact. The event engine still releases resources at
-the actual completion time, and accounting still integrates the measured power
-profile, so estimates influence decisions without replacing ground truth in the
-evaluation.
+`PowerCappedEASYScheduler` applies EASY while enforcing an aggregate power limit.
 
-### Why the energy-aware baseline caps power
+### Carbon-aware EASY
 
-Shifting a job changes neither its duration nor its power, so **total energy is
-invariant to the schedule** (§2.3 of the model formalization). A policy that
-tried to minimise energy would therefore have nothing to optimise, and the runs
-confirm it: every baseline reports the same MWh to six decimals.
+`CarbonAwareScheduler` holds each job until the lowest-carbon candidate within its delay budget, then returns it to normal EASY placement.
 
-What a power-aware policy can change is _when_ power is drawn. The baseline is
-the one a capped machine actually runs: never let the summed average power of
-the running jobs exceed `power_cap_watts`. It moves jobs in time for a power
-reason while staying blind to the grid signal — the precise contrast with a
-carbon-aware policy, which moves them for the opposite reason. The cap applies
-to both starting decisions and EASY reservations, so a pivot waiting for power
-headroom cannot be starved by later backfills. A job whose own average power
-exceeds the cap could never start, so it is rejected at release rather than
-left to stall the queue.
+Its main options are:
 
-### Carbon-aware scheduling with perfect information
+- `max_delay`: fixed voluntary delay budget;
+- `max_delay_fraction`: budget proportional to predicted runtime;
+- `forecast=True`: use the latest issued forecast rather than future actuals;
+- `reach`: limit the budget to the horizon a forecast archive can safely cover.
 
-`CarbonAwareScheduler` is the first policy that moves a job _because of the
-grid_. It is EASY backfilling plus one decision, taken once when a job becomes
-eligible: score every candidate start time inside the delay budget, then hold
-the job until the cheapest one.
+Scheduler names encode the selected combination, including:
 
-| Ingredient       | Choice                                                                      |
-| ---------------- | --------------------------------------------------------------------------- |
-| delay budget     | `max_delay`, measured from `release_time` — the origin §2.6 proposes        |
-| candidate starts | the release instant, then the grid signal's own boundaries up to the budget |
-| cost of a start  | `energy × mean intensity` over `[t, t + duration]`, average-power model     |
-| tie-break        | the earliest candidate, so a job is never held without a strict gain        |
+- `carbon-aware`
+- `carbon-scaled-delay`
+- `carbon-aware-forecast`
+- `carbon-forecast-scaled-delay`
 
-Three properties make the policy safe to compare against the baselines, and they
-are what `tests/check_carbon_aware.py` checks rather than any particular
-placement:
+with `-bounded` when applicable.
 
-- **`max_delay=0` reproduces EASY exactly**, start time for start time. The
-  sweep therefore begins at the baseline instead of at a different policy.
-- **A held job yields its place.** It is withheld from the placement pass rather
-  than refused a slot, so it never becomes the pivot and never blocks anyone: the
-  jobs behind it move up and the machine keeps working. When its target arrives
-  it re-enters at its original queue position, which bounds the harm — a job that
-  gives up its turn is at worst as delayed as the queue it rejoins.
-- **The budget bounds the _voluntary_ delay only.** Once its target arrives a job
-  competes for nodes like any other, and contention can still push it later. The
-  parameter bounds the delay the carbon decision is responsible for, which is the
-  quantity the trade-off is about; the total delay is what the QoS metrics report.
+### Carbon + power cap
 
-Because the schedule cannot change the signal and the signal cannot change the
-job, the cheapest start is fixed at release and never revisited. The policy asks
-for a wakeup at exactly that instant instead of subscribing to every bucket
-boundary, so a deferral costs one event per held job rather than one per bucket.
+`PowerCappedCarbonAwareScheduler` first applies the carbon target, then admits jobs only when both node and aggregate-power constraints allow them to start.
 
-`CarbonSignal` is the supporting piece: it materialises the provider's series
-once and keeps a cumulative integral, so scoring a candidate is two lookups no
-matter how long the job runs. A window reaching outside the available series
-raises instead of being clamped — a policy planning on invented data would
-report a saving the evaluation could never confirm.
+### Trace replay
 
-The decision reads `Job.scheduling_duration_seconds` and
-`Job.scheduling_average_power_watts`, the same seam every other policy uses, so
-substituting predictions turns the oracle into the realistic scenario without
-touching the policy. Evaluation still integrates the measured profile, and
-`average_model_gap` reports the residual difference on every run.
+`TraceReplayScheduler` starts every job at its recorded `start_time` and is used to validate the event engine.
 
-A job with `power=None` follows ordinary EASY placement immediately. It can
-block, backfill, allocate nodes and release them, but it has no carbon target.
-This is how terminal PM100 executions add resource contention without receiving
-an invented power value.
+Schedulers may call:
 
-The rule is greedy and per job: every
-job independently aims at the same clean interval, and the queueing that
-collectively creates is a cost the rule does not model. Perfect information
-bounds what _this_ policy can do, not what the offline problem admits — that
-belongs to the later optimisation formulation (§2.7).
+```python
+simulator.request_wakeup(when)
+```
 
-### Duration-scaled carbon delay
+Past wakeups raise an error. EASY does not require explicit wakeups because completions already trigger reservation recomputation.
 
-`max_delay_fraction` replaces the single wall-clock budget
-with `scheduling_duration_seconds × max_delay_fraction`. A factor of `1.0`
-means that a job may voluntarily wait up to 100% of its predicted runtime;
-without a prediction, the actual duration remains the existing
-perfect-information fallback. A factor of zero reproduces EASY.
+## Scheduling information
 
-The scheduler uses the same candidate grid and carbon-cost function as the
-fixed-delay policy. Consequently, a job whose budget does not reach the next
-grid boundary stays at release: no finer start is invented than the signal can
-resolve. This naturally protects short jobs, while longer jobs retain enough
-flexibility to reach cleaner intervals.
+Backfilling requires runtime estimates. `RuntimeEstimateSource` makes their source explicit:
 
-### Carbon-aware scheduling under a power cap
+| Source       | Estimate                          | Use                                                                 |
+| ------------ | --------------------------------- | ------------------------------------------------------------------- |
+| `TIME_LIMIT` | requested walltime                | classic EASY                                                        |
+| `SCHEDULING` | `Job.scheduling_duration_seconds` | predicted runtime, or actual runtime when no prediction is attached |
 
-`PowerCappedCarbonAwareScheduler` composes the two existing decisions without
-changing the event engine: a job first waits for the target selected from the
-carbon signal, then EASY admits it only when both nodes and aggregate power are
-available. Its reservations account for both resources. With `max_delay=0` it
-reproduces `PowerCappedEASYScheduler` start for start when both use the same
-runtime estimate.
+PM100 jobs are typically much shorter than their requested walltime: median runtime is **2.5%** of the requested limit. Walltime-based EASY therefore creates conservative reservations.
 
-The cap uses `Job.scheduling_average_power_watts`, because only the scheduling
-estimate is available at decision time. Consequently, a run using predicted
-power can respect the planned cap while exceeding it in the ex-post metric if
-the model underpredicts; with actual job inputs the two coincide. As with the
-power-capped baseline, a resource-only job with no power estimate is rejected.
+Power decisions similarly use:
 
-On the 5,000-job debug workload, with exact scheduling inputs, the fixed
-variants use a six-hour budget, the scaled scheduler uses a factor of `1.0`, and
-the cap is 80% of FCFS's peak:
+```python
+Job.scheduling_average_power_watts
+```
+
+Policies never read measured execution profiles directly.
+
+Models in `src/job_prediction/` populate both scheduling fields from prediction-only Parquet artifacts. Actual completion times still control resource release, while energy and emissions are scored from measured profiles.
+
+## Power-aware baseline
+
+Changing a start time does not change a job's duration or power profile, so total energy is schedule-invariant in this model.
+
+The power-aware baseline therefore constrains **when** power is consumed rather than trying to reduce total energy:
+
+```text
+sum(running job average power) <= power_cap_watts
+```
+
+The cap applies to both job starts and EASY reservations.
+
+Jobs whose own scheduling-power estimate exceeds the cap are rejected rather than left permanently queued.
+
+## Carbon-aware scheduling
+
+`CarbonAwareScheduler` evaluates candidate starts once when a job becomes eligible.
+
+| Component    | Definition                                                        |
+| ------------ | ----------------------------------------------------------------- |
+| delay budget | measured from `release_time`                                      |
+| candidates   | release time plus carbon-signal boundaries up to the budget       |
+| cost         | `energy × mean carbon intensity` over `[start, start + duration]` |
+| power model  | scheduling average power                                          |
+| tie-break    | earliest start                                                    |
+
+Important invariants:
+
+- `max_delay=0` reproduces EASY exactly;
+- a held job is removed from placement and cannot become the EASY pivot;
+- the delay budget bounds voluntary carbon delay, not later queueing delay;
+- once the target time arrives, the job competes normally for resources.
+
+The cheapest candidate is fixed at release, so the target is not reconsidered later.
+
+`CarbonSignal` materializes the source series once and stores a cumulative integral, making interval scoring constant-time. Requests outside available signal coverage raise an error.
+
+Jobs without a power value use ordinary EASY placement and receive no carbon target. This allows terminal PM100 executions to contribute node contention without assigning artificial energy data.
+
+The policy is greedy per job. Jobs may independently converge on the same clean interval, creating queueing and peak-power effects that are not part of the carbon objective.
+
+## Duration-scaled delay
+
+With:
+
+```python
+max_delay_fraction=f
+```
+
+the voluntary delay budget is:
+
+```text
+scheduling_duration_seconds * f
+```
+
+A factor of `1.0` permits a delay up to one predicted runtime. A factor of zero reproduces EASY.
+
+Candidate starts remain aligned to the carbon grid, so a budget shorter than the next grid boundary produces no shift.
+
+## Carbon scheduling under a power cap
+
+`PowerCappedCarbonAwareScheduler` combines the carbon target with the same aggregate-power constraint as `PowerCappedEASYScheduler`.
+
+With `max_delay=0`, both schedulers produce identical starts when given the same runtime estimates.
+
+The cap uses `Job.scheduling_average_power_watts`. With predicted power, the planned schedule may satisfy the cap while measured ex-post power exceeds it.
+
+Resource-only jobs without a power estimate are rejected by power-capped schedulers.
+
+### Debug workload
+
+5,000 jobs, exact scheduling inputs, six-hour fixed delay, duration-scaled factor `1.0`, and a cap equal to 80% of FCFS peak:
 
 | Scheduler          | Emissions (tCO2e) | Peak (MW) | Mean wait (s) | Wait p95 (s) | Mean slowdown |
-| ------------------ | -----------------: | --------: | ------------: | -----------: | ------------: |
-| EASY               |             4.6411 |     0.606 |          31.2 |          344 |          1.08 |
-| Power-capped EASY  |             4.6412 |     0.485 |          36.4 |          376 |          1.10 |
-| Carbon-aware       |             4.4245 |     0.586 |       6,391.4 |       20,353 |        225.70 |
-| Carbon + power cap |             4.4250 |     0.485 |       6,420.3 |       20,370 |        225.76 |
-| Duration-scaled    |             4.3962 |     0.593 |         257.0 |          444 |          1.14 |
+| ------------------ | ----------------: | --------: | ------------: | -----------: | ------------: |
+| EASY               |            4.6411 |     0.606 |          31.2 |          344 |          1.08 |
+| Power-capped EASY  |            4.6412 |     0.485 |          36.4 |          376 |          1.10 |
+| Carbon-aware       |            4.4245 |     0.586 |       6,391.4 |       20,353 |        225.70 |
+| Carbon + power cap |            4.4250 |     0.485 |       6,420.3 |       20,370 |        225.76 |
+| Duration-scaled    |            4.3962 |     0.593 |         257.0 |          444 |          1.14 |
 
-The cap reduces the carbon scheduler's peak by 17.2% while retaining 99.7744%
-of its saving against EASY: 0.2256% of the available saving is lost on this
-workload and configuration.
+The combined carbon/power policy cuts the carbon-aware peak by **17.2%** while retaining **99.7744%** of its saving against EASY.
 
-The scaled budget saves 5.28% against EASY, compared with 4.67% for the fixed
-six-hour budget, while reducing mean waiting from 6,391 to 257 seconds. Its
-maximum wait is 73,972 seconds because long jobs receive a correspondingly long
-budget; bounded slowdown remains much smaller (mean 1.14, maximum 8.53), which
-is the QoS normalization this policy is meant to provide.
+The duration-scaled policy saves **5.28%** against EASY, compared with **4.67%** for the fixed six-hour delay, while reducing mean wait from 6,391 s to 257 s.
 
-## Per-job records
+Its maximum wait is 73,972 s because long jobs receive larger budgets; mean bounded slowdown is 1.14 and maximum bounded slowdown is 8.53.
 
-`JobRecord` carries simulated `start_time`/`end_time`, plus waiting and
-turnaround measured from **both** `release_time` and `submit_time`. The project
-has not fixed that convention: eligibility is the natural origin for a delay
-budget, submission is what a user perceives, so both are recorded and the choice
-stays open.
+## Per-job records and accounting
 
-`account_schedule(result, jobs, provider)` then fills in, per job:
+`JobRecord` stores simulated start and end times plus waiting and turnaround relative to both:
 
-| Field                                                       | Meaning                                                                            |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `energy_kwh`, `emissions_gco2e`                             | the measured PM100 profile against the actual signal — the evaluation ground truth |
-| `energy_kwh_average_model`, `emissions_gco2e_average_model` | what a scheduler using one mean power would have modelled                          |
+- `release_time`;
+- `submit_time`.
 
-Carrying both makes the model error of the simple representation a byproduct of
-every run rather than a separate experiment. On the debug subset the gap is
-about **0.2%** of total emissions.
+`account_schedule(result, jobs, provider)` adds:
 
-Accounting deliberately happens _after_ the event loop. The engine stays
-carbon-agnostic, so a forecast provider can be substituted later
-without touching it. `check_coverage` fails early and legibly when a schedule
-runs past the end of the cached series, instead of dying inside an accounting
-loop with a bare missing-bucket error.
+| Field                           | Meaning                                          |
+| ------------------------------- | ------------------------------------------------ |
+| `energy_kwh`                    | measured PM100 power profile                     |
+| `emissions_gco2e`               | measured profile against actual carbon intensity |
+| `energy_kwh_average_model`      | average-power approximation                      |
+| `emissions_gco2e_average_model` | average-power emissions approximation            |
 
-For a mixed resource workload, `SimulationResult.replace_records` selects the
-clean evaluation ids before accounting. It preserves the full run's busy-node
-time, peak and makespan while keeping terminal jobs out of energy, carbon and
-per-job QoS summaries.
+The measured values are evaluation ground truth. On the debug subset, the average-power emissions approximation differs by about **0.2%** in aggregate.
 
-Jobs are loaded with the **duration-weighted** mean of the measured profile, not
-the stored `node_power_mean_W` arithmetic mean. Only the weighted mean makes the
-average and measured models consume identical energy, which is what isolates the
-timing effect from a power representation artefact. Pass
-`average_power_source="stored"` to compare against the stored value.
+Accounting runs after simulation, keeping the event engine independent of the carbon provider.
+
+`check_coverage` validates that the final schedule remains inside the available carbon series before accounting begins.
+
+For mixed clean/terminal workloads, `SimulationResult.replace_records` retains only clean evaluation jobs for energy, carbon, and QoS summaries while preserving full-run node occupancy, peak, and makespan.
+
+Average job power defaults to the **duration-weighted mean** of the measured profile. This guarantees that measured and average-power representations consume the same energy.
+
+Use:
+
+```python
+average_power_source="stored"
+```
+
+to use the trace's stored arithmetic mean instead.
 
 ## Metrics
 
-`schedule_metrics(result)` scores a finished, accounted run. It reads only a
-`SimulationResult`, so it cannot tell which policy produced the schedule — which
-is the point: baselines and carbon-aware policies are judged by the same
-function on the same workload.
+`schedule_metrics(result)` operates only on an accounted `SimulationResult`.
 
-| Group  | Reported                                                                        |
-| ------ | ------------------------------------------------------------------------------- |
-| Carbon | total and mean-per-job emissions, and the same totals under the average model   |
-| Energy | total energy, and the schedule's peak aggregate power                           |
-| QoS    | waiting, turnaround, and bounded slowdown — each as mean, median, p95, p99, max |
-| System | node utilisation, peak nodes, makespan, throughput                              |
+| Group  | Metrics                                                     |
+| ------ | ----------------------------------------------------------- |
+| Carbon | total and mean emissions, measured and average-power models |
+| Energy | total energy, peak aggregate power                          |
+| QoS    | waiting, turnaround, bounded slowdown                       |
+| System | node utilisation, peak nodes, makespan, throughput          |
 
-Every QoS quantity is a `Distribution`, not a mean. A policy that defers jobs to
-chase clean electricity can improve an average while punishing a minority
-badly, so the tail is reported next to the mean by construction rather than on
-request.
+Each QoS quantity is reported as a `Distribution` containing mean, median, p95, p99, and maximum.
 
-Bounded slowdown is `max(1, (wait + runtime) / max(runtime, 10 s))`. The 10 second
-floor is the usual convention and it matters here: PM100 has many very short
-jobs, and without it a job that runs for one second and waits for a hundred
-would report a slowdown of 101 and dominate the mean.
+Bounded slowdown is:
 
-`reference="release"` (default) measures waiting from eligibility, the origin
-the model formalization proposes for a delay budget; `reference="submit"` gives
-the user-perceived figure. Both are available because the project has not fixed
-the convention.
+```text
+max(1, (wait + runtime) / max(runtime, 10 s))
+```
 
-Peak power is computed from each job's duration-weighted mean power, recovered
-from its accounted energy. It is therefore a floor on the true peak — the
-20-second profile fluctuates inside every job — but it is exactly the quantity a
-power-capped policy controls.
+The 10-second floor prevents very short PM100 jobs from dominating the metric.
+
+`reference="release"` is the default QoS origin. `reference="submit"` reports user-perceived delay.
+
+Peak power is reconstructed from each job's duration-weighted mean power. It does not capture within-job 20-second fluctuations, but it matches the quantity controlled by power-capped schedulers.
 
 ## Use
 
 ```python
-import sys; sys.path.insert(0, "src")
+import sys
+sys.path.insert(0, "src")
 
 from carbon_intensity import TimeSeriesCarbonIntensityProvider
 from hpc_sim import (
@@ -337,16 +292,23 @@ from hpc_sim import (
 from hpc_sim.workload import load_jobs
 
 jobs = load_jobs("data/processed/pm100_debug_5000.parquet")
-result = Simulator(jobs, Cluster(880), FCFSScheduler()).run()
+
+result = Simulator(
+    jobs,
+    Cluster(880),
+    FCFSScheduler(),
+).run()
 
 provider = TimeSeriesCarbonIntensityProvider.load(
     "data/carbon_intensity/electricity_maps_it_no_04_to_11_2020.json"
 )
+
 result = account_schedule(result, jobs, provider)
+
 print(format_metrics(schedule_metrics(result)))
 ```
 
-Swapping the policy is the only change needed to compare:
+Policy examples:
 
 ```python
 from datetime import timedelta
@@ -359,73 +321,158 @@ from hpc_sim import (
     RuntimeEstimateSource,
 )
 
-EASYBackfillScheduler()                                       # classic, plans on requested walltime
-EASYBackfillScheduler(runtime_estimate=RuntimeEstimateSource.SCHEDULING)  # perfect information
-PowerCappedEASYScheduler(power_cap_watts=680_000.0)           # energy-aware baseline
-CarbonAwareScheduler(provider, max_delay=timedelta(hours=6))  # carbon-aware oracle
-CarbonAwareScheduler(provider, max_delay_fraction=1.0)        # delay = predicted duration
-CarbonAwareScheduler(                                         # issued forecasts only
-    archive_provider, forecast=True, max_delay=timedelta(hours=6), reach=reach
+# Classic EASY: requested walltime
+EASYBackfillScheduler()
+
+# EASY with scheduling-time runtime estimate
+EASYBackfillScheduler(
+    runtime_estimate=RuntimeEstimateSource.SCHEDULING
 )
-CarbonAwareScheduler(                                         # both restrictions at once
-    archive_provider, forecast=True, max_delay_fraction=1.0, reach=reach
+
+# Power-aware baseline
+PowerCappedEASYScheduler(
+    power_cap_watts=680_000.0
 )
-PowerCappedCarbonAwareScheduler(                              # carbon plus the same cap
-    provider, 680_000.0, max_delay=timedelta(hours=6)
+
+# Carbon-aware oracle
+CarbonAwareScheduler(
+    provider,
+    max_delay=timedelta(hours=6),
+)
+
+# Runtime-scaled delay
+CarbonAwareScheduler(
+    provider,
+    max_delay_fraction=1.0,
+)
+
+# Issued forecasts
+CarbonAwareScheduler(
+    archive_provider,
+    forecast=True,
+    max_delay=timedelta(hours=6),
+    reach=reach,
+)
+
+CarbonAwareScheduler(
+    archive_provider,
+    forecast=True,
+    max_delay_fraction=1.0,
+    reach=reach,
+)
+
+# Carbon + power cap
+PowerCappedCarbonAwareScheduler(
+    provider,
+    680_000.0,
+    max_delay=timedelta(hours=6),
 )
 ```
 
-`hpc_sim` itself is standard-library only; `hpc_sim.workload` is the single
-module that needs pyarrow.
+`hpc_sim` itself uses only the standard library. `hpc_sim.workload` additionally requires `pyarrow`.
+
+### CLI examples
 
 ```bash
-.venv/bin/python scripts/run_simulation.py --scheduler replay --limit 5000
-.venv/bin/python scripts/run_simulation.py --scheduler easy \
-  --workload data/processed/pm100_clean.parquet
-.venv/bin/python scripts/run_simulation.py --scheduler power-cap --power-cap-mw 0.68
-.venv/bin/python scripts/run_simulation.py --scheduler carbon --max-delay-hours 6 \
-  --runtime-estimate scheduling
-.venv/bin/python scripts/run_simulation.py --scheduler carbon-scaled-delay \
-  --max-delay-fraction 1 --runtime-estimate scheduling
-.venv/bin/python scripts/run_simulation.py --scheduler carbon-power-cap \
-  --power-cap-mw 0.485 --max-delay-hours 6 --runtime-estimate scheduling
-.venv/bin/python scripts/run_simulation.py --scheduler carbon-forecast \
-  --carbon-cache data/carbon_intensity/actual/actual.json \
-  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
-  --max-delay-hours 6 --runtime-estimate scheduling
-.venv/bin/python scripts/run_simulation.py --scheduler carbon-forecast-scaled-delay \
-  --carbon-cache data/carbon_intensity/actual/actual.json \
-  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
-  --max-delay-fraction 1 --runtime-estimate scheduling
+# Replay
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler replay --limit 5000
 
-# held-out jobs, predicted inputs for decisions, actual outcomes for scoring
+# EASY
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler easy \
+  --workload data/processed/pm100_clean.parquet
+
+# Power cap
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler power-cap \
+  --power-cap-mw 0.68
+
+# Fixed-delay carbon oracle
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler carbon \
+  --max-delay-hours 6 \
+  --runtime-estimate scheduling
+
+# Runtime-scaled carbon oracle
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler carbon-scaled-delay \
+  --max-delay-fraction 1 \
+  --runtime-estimate scheduling
+
+# Carbon + power cap
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler carbon-power-cap \
+  --power-cap-mw 0.485 \
+  --max-delay-hours 6 \
+  --runtime-estimate scheduling
+
+# Forecast-based carbon scheduling
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler carbon-forecast \
+  --carbon-cache data/carbon_intensity/actual/actual.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_boosted_ridge.json \
+  --max-delay-hours 6 \
+  --runtime-estimate scheduling
+
+# Forecast + runtime-scaled delay
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler carbon-forecast-scaled-delay \
+  --carbon-cache data/carbon_intensity/actual/actual.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_boosted_ridge.json \
+  --max-delay-fraction 1 \
+  --runtime-estimate scheduling
+```
+
+Job-model evaluation:
+
+```bash
 .venv/bin/python scripts/train_job_models.py
-.venv/bin/python scripts/run_simulation.py --scheduler carbon \
+
+.venv/bin/python scripts/run_simulation.py \
+  --scheduler carbon \
   --workload data/processed/pm100_clean.parquet \
   --job-predictions data/job_predictions/test_predictions.parquet
+```
 
-# every baseline over one workload, side by side, into a CSV
-.venv/bin/python scripts/compare_baselines.py --limit 5000
+Baseline comparison:
 
-# Add fixed-delay, capped and duration-scaled carbon-aware policies
-.venv/bin/python scripts/compare_baselines.py --limit 5000 --no-replay \
-  --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1 \
+```bash
+.venv/bin/python scripts/compare_baselines.py \
+  --limit 5000
+```
+
+Carbon and power-aware variants:
+
+```bash
+.venv/bin/python scripts/compare_baselines.py \
+  --limit 5000 \
+  --no-replay \
+  --runtime-estimate scheduling \
+  --max-delay-hours 6 \
+  --max-delay-fraction 1 \
   --power-cap-fraction 0.8
+```
 
-# ... and the same policies on issued forecasts, with oracle recovery per archive
-.venv/bin/python scripts/compare_baselines.py --limit 5000 --no-replay \
-  --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1 \
+Forecast comparison:
+
+```bash
+.venv/bin/python scripts/compare_baselines.py \
+  --limit 5000 \
+  --no-replay \
+  --runtime-estimate scheduling \
+  --max-delay-hours 6 \
+  --max-delay-fraction 1 \
   --carbon-cache data/carbon_intensity/actual/actual.json \
-  --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_boosted_ridge.json \
   --forecast-archive data/carbon_intensity/snapshots/test_seasonal_daily.json
+```
 
-# the whole matrix in one CSV: job information x carbon signal x delay policy.
-# Each --job-predictions artifact adds a labelled arm, and the cohort they all
-# cover is also run with actual durations and power; each --forecast-archive
-# adds a signal arm, all of them bounded by one shared reach together with the
-# oracle their oracle_recovery is measured against. Scoring stays ex post:
-# measured power profiles against observed intensity, whatever a run planned on.
-.venv/bin/python scripts/compare_baselines.py --no-replay \
+Full job-information × carbon-signal × delay-policy matrix:
+
+```bash
+.venv/bin/python scripts/compare_baselines.py \
+  --no-replay \
   --workload data/processed/pm100_clean.parquet \
   --job-predictions gradient=data/job_predictions/test_predictions.parquet \
   --job-predictions ridge=data/job_predictions/ridge_baseline/test_predictions.parquet \
@@ -434,292 +481,268 @@ module that needs pyarrow.
   --forecast-archive data/carbon_intensity/snapshots/test_seasonal_daily.json \
   --forecast-archive data/carbon_intensity/snapshots/test_seasonal_weekly.json \
   --forecast-archive data/carbon_intensity/snapshots/test_ridge_direct.json \
-  --runtime-estimate scheduling --max-delay-hours 6 --max-delay-fraction 1
+  --forecast-archive data/carbon_intensity/snapshots/test_ridge_refit_once.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_ridge_refit_14d.json \
+  --forecast-archive data/carbon_intensity/snapshots/test_boosted_ridge.json \
+  --runtime-estimate scheduling \
+  --max-delay-hours 6 \
+  --max-delay-fraction 1
+```
 
-# the carbon / QoS frontier: one run per delay budget, EASY as the reference
-.venv/bin/python scripts/carbon_tradeoff.py --limit 5000
-.venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
-  --max-delay-hours 6 24 --decision-granularity-minutes 15 60 240
+Each prediction artifact adds a labelled scheduling-input arm. Each forecast archive adds a carbon-signal arm. Oracle and forecast runs share the same reachable horizon, and all runs are scored ex-post from measured power and actual carbon intensity.
 
-# the frontier a system that only has a model reaches: the held-out cohort
-# swept twice, actual durations against predicted ones
+Carbon/QoS frontier:
+
+```bash
+.venv/bin/python scripts/carbon_tradeoff.py \
+  --limit 5000
+
+.venv/bin/python scripts/carbon_tradeoff.py \
+  --limit 5000 \
+  --max-delay-hours 6 24 \
+  --decision-granularity-minutes 15 60 240
+```
+
+Predicted-input frontier:
+
+```bash
 .venv/bin/python scripts/carbon_tradeoff.py \
   --workload data/processed/pm100_clean.parquet \
   --job-predictions data/job_predictions/test_predictions.parquet \
-  --max-delay-hours 0 1 3 6 12 24 --decision-granularity-minutes 15
+  --max-delay-hours 0 1 3 6 12 24 \
+  --decision-granularity-minutes 15
+```
 
-# the same FCFS/EASY/carbon experiment with terminal jobs consuming nodes
-.venv/bin/python scripts/carbon_tradeoff.py --limit 5000 \
-  --contention-workload data/job_table.parquet --max-delay-hours 0 6
+Terminal-contention scenario:
 
-# every test in the repository, including the carbon_intensity in-package checks
-.venv/bin/python -m unittest discover -s tests -p "check_*.py"
+```bash
+.venv/bin/python scripts/carbon_tradeoff.py \
+  --limit 5000 \
+  --contention-workload data/job_table.parquet \
+  --max-delay-hours 0 6
+```
 
-# or one file at a time
-.venv/bin/python tests/check_simulator.py
-.venv/bin/python tests/check_baselines.py
-.venv/bin/python tests/check_carbon_aware.py
+Tests:
+
+```bash
+.venv/bin/python -m unittest discover \
+  -s tests \
+  -p "check_*.py"
+
+.venv/bin/python tests/check_hpc_sim_simulator.py
+.venv/bin/python tests/check_hpc_sim_baselines.py
+.venv/bin/python tests/check_hpc_sim_carbon_aware.py
 .venv/bin/python tests/check_job_prediction.py
 ```
 
-The packages are importable because `pyproject.toml` declares them and the
-venv has them installed in place:
+Editable install:
 
 ```bash
 .venv/bin/pip install -e .
 ```
 
-The full 157,062-job trace takes roughly fourteen minutes for the four-policy
-comparison. Almost all of it is emission accounting, which integrates every
-20-second power sample against the grid signal; the scheduling itself is under
-a second per policy.
+The full 157,062-job trace takes about fourteen minutes for a four-policy comparison. Most runtime is spent integrating 20-second power samples during emission accounting; scheduling itself takes under a second per policy.
 
 ## Validation
 
-`TraceReplayScheduler` re-runs the schedule the real system produced. On both
-the 5,000-job debug subset and the full 157,062-job clean trace it reproduces
-**every** recorded start time exactly (max delay 0 s), and its peak occupancy of
-774 nodes matches an independent sweep-line computation over the source table.
-That is the engine's ground-truth anchor. FCFS on the full trace reaches exactly
-880 busy nodes and never exceeds them.
+`TraceReplayScheduler` reproduces every recorded start time exactly on both the 5,000-job debug subset and the full 157,062-job clean trace.
 
-The terminal-contention loader admits 50,165 valid non-completed partition-1
-executions: 29,561 failed, 10,876 cancelled, 8,564 timed out, 997 out of memory
-and 167 node failures. They all enter the event simulator without a power
-profile. One additional timed-out execution has eligibility before submission
-and 18 rows have no positive execution interval; none is repaired or admitted.
+Its peak occupancy is **774 nodes**, matching an independent sweep-line calculation. FCFS reaches the configured capacity of 880 nodes without exceeding it.
 
-Energy is identical across policies (553.34 MWh on the full trace, every
-scheduler, to six decimals) while emissions differ (156.333 tCO2e for replay
-against 156.536 for FCFS). That is the energy-aware versus carbon-aware
-distinction, reproduced at schedule level.
+The terminal-contention loader admits **50,165** valid non-completed partition-1 executions:
 
-EASY's reservation promise is checked directly rather than through its outcomes:
-`EASYBackfillScheduler.first_reservations` records what each pivot was promised,
-and no job — on random workloads or on the PM100 subset — ever starts after it.
-The hand computed cases in `tests/check_baselines.py` pin the three decisions
-that matter: a short job overtakes the blocked head, a long one that would push
-the reservation back does not, and a long one that fits in nodes the pivot will
-not claim does.
+| Status        |   Jobs |
+| ------------- | -----: |
+| Failed        | 29,561 |
+| Cancelled     | 10,876 |
+| Timeout       |  8,564 |
+| Out of memory |    997 |
+| Node failure  |    167 |
 
-The carbon-aware policy is checked the same way, on its own contract rather than
-its placements (`tests/check_carbon_aware.py`): the predicted cost of a start
-time agrees with `carbon_accounting` to nine decimals, no job on the PM100
-subset is ever held past its budget or started before its target, a zero budget
-reproduces EASY start time for start time, and holding jobs changes emissions
-while leaving energy identical. The combined policy is also checked against all
-four expected carbon, peak-power and QoS outcomes on a synthetic clean bucket;
-at zero delay it reproduces power-capped EASY exactly. The duration-scaled
-check verifies that its budget follows the predicted duration when one exists,
-and a zero factor reproduces EASY.
+These executions consume nodes but have no power profiles.
+
+One additional timed-out execution has eligibility before submission, and 18 records have no positive execution interval; these are rejected rather than repaired.
+
+Across the full clean trace, energy is identical for all schedulers:
+
+```text
+553.34 MWh
+```
+
+to six decimals.
+
+Emissions differ because schedules overlap the carbon signal differently:
+
+- replay: `156.333 tCO2e`;
+- FCFS: `156.536 tCO2e`.
+
+EASY reservations are checked directly through `first_reservations`: no pivot begins after its promised start on synthetic, random, or PM100 workloads.
+
+Tests also cover:
+
+- a short safe backfill;
+- a long backfill that would violate the reservation;
+- a long backfill using capacity not required by the pivot.
+
+Carbon-aware tests verify:
+
+- candidate cost matches `carbon_accounting` to nine decimals;
+- targets remain within delay budgets;
+- jobs never start before their selected carbon target;
+- zero delay reproduces EASY exactly;
+- carbon-aware shifts change emissions without changing energy;
+- duration-scaled budgets use predicted duration;
+- zero duration factor reproduces EASY;
+- zero-delay carbon + power-cap reproduces power-capped EASY.
 
 ## Baseline results
 
-The four policies over the full 157,062-job trace, 880 nodes, classic
-walltime estimates, cap at 80% of the FCFS peak:
+Full 157,062-job clean trace, 880 nodes, requested-walltime EASY estimates, power cap at 80% of FCFS peak:
 
-| Metric                | replay  | FCFS    | EASY    | power-cap |
-| --------------------- | ------- | ------- | ------- | --------- |
-| emissions (tCO2e)     | 156.333 | 156.536 | 156.536 | 156.529   |
-| energy (MWh)          | 553.34  | 553.34  | 553.34  | 553.34    |
-| peak power (MW)       | 0.700   | 0.846   | 0.852   | 0.676     |
-| waiting mean (s)      | 2,434.3 | 277.8   | 252.7   | 222.9     |
-| waiting p99 (s)       | 62,099  | 10,341  | 10,004  | 8,993     |
-| waiting max (s)       | 410,317 | 56,649  | 58,043  | 58,043    |
-| bounded slowdown mean | 71.37   | 2.41    | 2.12    | 1.68      |
-| bounded slowdown max  | 35,852  | 4,344   | 4,320   | 2,690     |
+| Metric                |  Replay |    FCFS |    EASY | Power cap |
+| --------------------- | ------: | ------: | ------: | --------: |
+| Emissions (tCO2e)     | 156.333 | 156.536 | 156.536 |   156.529 |
+| Energy (MWh)          |  553.34 |  553.34 |  553.34 |    553.34 |
+| Peak power (MW)       |   0.700 |   0.846 |   0.852 |     0.676 |
+| Mean wait (s)         | 2,434.3 |   277.8 |   252.7 |     222.9 |
+| Wait p99 (s)          |  62,099 |  10,341 |  10,004 |     8,993 |
+| Wait max (s)          | 410,317 |  56,649 |  58,043 |    58,043 |
+| Mean bounded slowdown |   71.37 |    2.41 |    2.12 |      1.68 |
+| Max bounded slowdown  |  35,852 |   4,344 |   4,320 |     2,690 |
 
-Three things in that table are worth stating explicitly.
+The carbon-blind baselines have nearly identical emissions. Their scheduling objectives do not use carbon intensity.
 
-**Emissions barely move between the baselines.** They are not trying to move
-them: all three are carbon blind, and the differences here are incidental
-consequences of a slightly different overlap with the grid signal. That flatness
-is what makes them a fair reference point for the carbon-aware policy, whose
-results are below.
+The power cap reduces peak power from `0.846` to `0.676 MW` without changing total energy.
 
-**The power cap trades peak power for time, not for energy.** It cuts the peak
-from 0.846 to 0.676 MW — the budget it was given, to three decimals — while
-consuming exactly the same MWh. That is the energy-aware baseline doing the only
-thing it can do in this model.
+Its lower mean waiting time comes from redistribution rather than a uniformly better schedule. Among the 157,062 jobs:
 
-**The cap's mean waiting time _improves_, and the mean is lying.** Capping power
-blocks the head of the queue more often, and every block is a backfill opening
-for a short job. Broken down by job width, one-node jobs (120,113 of 157,062)
-wait 58s instead of 87s, while 65–256-node jobs wait 1,099s instead of 520s.
-The cap does not make the system faster; it moves delay off the many narrow jobs
-onto the few wide ones, and the unchanged 58,043s maximum shows the worst-served
-job is no better off. This is exactly the failure mode the QoS distributions
-exist to catch, and the same one a carbon-aware policy will be tempted to
-produce.
+- 120,113 one-node jobs wait 58 s instead of 87 s;
+- 65–256-node jobs wait 1,099 s instead of 520 s.
+
+The maximum wait remains 58,043 s.
 
 ## Carbon-aware results
 
-`CarbonAwareScheduler` over the same 157,062-job trace and 880 nodes, on the
-provider's 15-minute grid, with perfect information (`scheduling` estimates).
-The zero-budget row _is_ EASY, so every column can be read as a cost relative to
-it; the carbon-blind baselines agree on emissions to five significant figures
-(FCFS 156.536, EASY 156.535 tCO2e), so the saving does not depend on which one
-it is measured against.
+Full trace, 880 nodes, 15-minute carbon grid, `SCHEDULING` runtime estimates:
 
-| delay budget | emissions (tCO2e) | saved | waiting mean (s) | waiting p95 (s) | bounded slowdown mean | bounded slowdown p95 | peak power (MW) |
-| ------------ | ----------------- | ----- | ---------------- | --------------- | --------------------- | -------------------- | --------------- |
-| 0 (= EASY)   | 156.535           | 0.00% | 251              | 111             | 2.09                  | 1.51                 | 0.852           |
-| 1 h          | 155.894           | 0.41% | 1,245            | 3,430           | 32.11                 | 240.3                | 0.866           |
-| 3 h          | 154.577           | 1.25% | 4,290            | 10,541          | 142.42                | 887.1                | 0.877           |
-| 6 h          | 153.008           | 2.25% | 8,402            | 21,236          | 287.60                | 1,776.5              | 0.878           |
-| 12 h         | 149.631           | 4.41% | 17,630           | 42,681          | 566.75                | 3,268.4              | 0.857           |
-| 24 h         | 145.427           | 7.10% | 49,067           | 85,688          | 1,679.09              | 8,078.6              | 0.903           |
+| Delay budget | Emissions (tCO2e) | Saved | Mean wait (s) | Wait p95 (s) | Mean slowdown | Slowdown p95 | Peak MW |
+| ------------ | ----------------: | ----: | ------------: | -----------: | ------------: | -----------: | ------: |
+| 0 (= EASY)   |           156.535 | 0.00% |           251 |          111 |          2.09 |         1.51 |   0.852 |
+| 1 h          |           155.894 | 0.41% |         1,245 |        3,430 |         32.11 |        240.3 |   0.866 |
+| 3 h          |           154.577 | 1.25% |         4,290 |       10,541 |        142.42 |        887.1 |   0.877 |
+| 6 h          |           153.008 | 2.25% |         8,402 |       21,236 |        287.60 |      1,776.5 |   0.878 |
+| 12 h         |           149.631 | 4.41% |        17,630 |       42,681 |        566.75 |      3,268.4 |   0.857 |
+| 24 h         |           145.427 | 7.10% |        49,067 |       85,688 |      1,679.09 |      8,078.6 |   0.903 |
 
-Energy is 553.34 MWh in every row, as it must be.
+Energy remains `553.34 MWh` in every row.
 
-**The saving is real, and the exchange rate is poor.** Carbon falls
-monotonically with the budget, which is the answer to "does carbon-aware
-scheduling do anything at all": it does, and 7.1% is four orders of magnitude
-above the difference between the carbon-blind baselines themselves. But the QoS side grows faster
-than the carbon side throughout: going from a one hour budget to a
-twentyfour hour one multiplies the saving by 17 and the mean waiting time by 39.
-The interesting region of this frontier is its left end, not its right.
+Carbon savings increase monotonically with delay budget, but QoS costs increase much faster. From a 1-hour to a 24-hour budget, carbon saving grows by about 17× while mean waiting grows by about 39×.
 
-**The grid signal, not the policy, sets the ceiling.** Over the cached IT-NO
-2020 series the median intra-day range is 71 gCO2e/kWh, 24.5% of that day's
-mean, and the cleanest quarter-hour of a day sits only about 11% below the daily
-mean. A policy that shifts work inside a day therefore cannot save much more
-than a tenth of the total no matter how cleverly it aims, and the 7.1% reached
-at a 24-hour budget is already close to that. Reporting a saving without the
-amplitude of the signal it came from would make this number look like a property
-of the scheduler when it is mostly a property of the zone.
+The 2020 IT-NO series also limits the available benefit. Its median daily range is `71 gCO2e/kWh`, or 24.5% of daily mean intensity, while the cleanest quarter-hour is about 11% below the day's mean. A 24-hour scheduler therefore has limited room to reduce emissions even with perfect information.
 
-**Peak power goes up, not down** — 0.852 to 0.903 MW at the widest budget. The
-greedy rule optimises each job in isolation and every job aims at the same clean
-interval, so the policy manufactures exactly the concentration the power-capped
-baseline exists to prevent. The combined policy above now measures how much of
-that concentration can be removed and how much carbon saving it costs.
+Peak power increases to `0.903 MW` at a 24-hour budget because many jobs independently target the same low-carbon periods.
 
-**And the means understate the damage**, in the same way they did for the power
-cap. At a six-hour budget the mean bounded slowdown is 288 while the p95 is
-1,777: the average is carried by jobs that were held a little, and the tail by
-jobs that were held the whole budget and then met a busy machine. This is the
-tail that a delay budget bounds only in its voluntary part.
+Tail QoS is substantially worse than the mean. At a 6-hour budget:
 
-### Decision granularity
+- mean bounded slowdown: `287.60`;
+- p95 bounded slowdown: `1,776.5`.
 
-How finely the policy is allowed to aim, on the 5,000-job debug subset:
+## Decision granularity
 
-| decision grid | 6 h budget saved | 24 h budget saved |
-| ------------- | ---------------- | ----------------- |
-| 15 min        | 4.67%            | 11.09%            |
-| 60 min        | 4.45%            | 10.94%            |
-| 240 min       | 3.67%            | 9.94%             |
+5,000-job debug workload:
 
-Coarsening the grid from 15 to 60 minutes costs almost nothing, and going to
-four hours gives up about a fifth of the saving. The signal simply does not
-carry much structure below the hour, which is worth knowing before a forecast is
-introduced: a forecast that is accurate hour by hour loses little against a
-perfect quarter-hourly one.
+| Decision grid | 6 h saved | 24 h saved |
+| ------------- | --------: | ---------: |
+| 15 min        |     4.67% |     11.09% |
+| 60 min        |     4.45% |     10.94% |
+| 240 min       |     3.67% |      9.94% |
 
-The subset saves more than the full trace at the same budget (11.1% against
-7.1% at 24 hours) because it covers a different and much shorter stretch of the
-series. Frontier numbers are only comparable within one workload window, which
-is the sensitivity analysis the final experiments still owe.
+Moving from 15-minute to hourly decisions loses little. A four-hour grid loses roughly one fifth of the saving.
 
-The six-point sweep over the full trace takes about half an hour, again almost
-entirely emission accounting.
+The debug subset reaches larger savings than the full trace because it covers a different period of the carbon series. Frontier values are therefore comparable only within the same workload window.
 
-### With predicted scheduling inputs
+## Predicted scheduling inputs
 
-Everything above plans with perfect information. This sweep prices what the
-frontier is worth to a system that only has a model, and it is the same
-experiment twice over one cohort: the 23,560 held-out test jobs of
-[the job models](../job_prediction/README.md), 880 nodes, 15-minute grid, once
-planning with actual durations and once with the gradient model's. Only the
-estimates the policies plan with change; completion, energy and emissions are
-always scored from the measured trace.
+The held-out job-model cohort contains **23,560 jobs**. The same carbon experiment is run twice:
 
-`saved` is measured against EASY on actual durations (17.4712 tCO2e) in every
-row, so the two halves share a denominator. `retained` is the share of that
-budget's perfect-information saving the model keeps.
+1. with actual scheduling durations and powers;
+2. with gradient-model predictions.
 
-| delay budget | actual tCO2e | saved | predicted tCO2e |  saved | retained |
-| ------------ | -----------: | ----: | --------------: | -----: | -------: |
-| 0 (= EASY)   |      17.4712 | 0.00% |         17.4754 | -0.02% |        - |
-| 1 h          |      17.4347 | 0.21% |         17.4549 |  0.09% |   44.69% |
-| 3 h          |      17.3210 | 0.86% |         17.3951 |  0.44% |   50.66% |
-| 6 h          |      17.2402 | 1.32% |         17.3727 |  0.56% |   42.65% |
-| 12 h         |      16.9118 | 3.20% |         17.1681 |  1.73% |   54.18% |
-| 24 h         |      16.7036 | 4.39% |         17.0137 |  2.62% |   59.61% |
+Completion times, energy, and emissions always use measured outcomes.
 
-The 6-hour row reproduces `job_prediction.scheduling_impact` exactly, which is
-worth stating because the two arrive there by different code paths.
+`saved` is measured against EASY with actual scheduling inputs (`17.4712 tCO2e`). `retained` is the fraction of perfect-information carbon saving preserved by the predicted-input run.
 
-**The model keeps between two fifths and three fifths of the saving, and the
-wider the budget the more it keeps.** Retention rises from 44.7% at one hour to
-59.6% at twenty-four. A duration error costs carbon by moving the job's target
-into a different quarter-hour, and a wide budget offers more nearly-as-clean
-slots to land in, so the same error is cheaper there. The exception is the
-six-hour row at 42.65%, the lowest of the sweep; retention is not monotone
-because it depends on where the errors happen to fall against that particular
-window of the signal, not only on their size.
+| Delay | Actual tCO2e | Saved | Predicted tCO2e |  Saved | Retained |
+| ----- | -----------: | ----: | --------------: | -----: | -------: |
+| 0     |      17.4712 | 0.00% |         17.4754 | -0.02% |        — |
+| 1 h   |      17.4347 | 0.21% |         17.4549 |  0.09% |   44.69% |
+| 3 h   |      17.3210 | 0.86% |         17.3951 |  0.44% |   50.66% |
+| 6 h   |      17.2402 | 1.32% |         17.3727 |  0.56% |   42.65% |
+| 12 h  |      16.9118 | 3.20% |         17.1681 |  1.73% |   54.18% |
+| 24 h  |      16.7036 | 4.39% |         17.0137 |  2.62% |   59.61% |
 
-**The frontier itself is flatter here than on the full trace** — 4.39% against
-7.10% at a 24-hour budget — because this cohort is the last ten days of the
-trace rather than all of it, and it meets a different stretch of the grid
-signal. Frontier numbers are comparable within one workload window and not
-across two, so the perfect-information column, not the table above, is what the
-predicted column should be read against.
+The 6-hour row matches `job_prediction.scheduling_impact`.
 
-**Prediction error costs QoS before any carbon policy runs.** The zero-budget
-row is not zero: it emits 0.02% *more* than EASY on actual durations, and its
-mean waiting is 458.3 s against 422.9 s with a mean bounded slowdown of 3.00
-against 2.11. That row is plain EASY, so the loss is entirely backfill, and it
-is total: over the cohort EASY places 1,247 jobs differently from strict FCFS
-when it plans with actual durations, and **zero** when it plans with predicted
-ones. Its schedule is FCFS, job for job.
+Predicted scheduling inputs preserve roughly 40–60% of the perfect-information carbon saving. Retention generally improves with wider delay budgets because duration errors have more alternative low-carbon starts available.
 
-The mechanism is the reservation guard in `EASYBackfillScheduler.select`. The
-pivot's reservation is projected from the estimated remaining time of the jobs
-holding the nodes, and the model under-predicts (bias -568 s overall, -14,140 s
-on jobs of at least three hours). Every running long job is therefore projected
-to have already finished, the reservation lands at or before `now`, and the
-scheduler — correctly, because a projection that disagrees with the cluster
-cannot be trusted — falls back to strict FCFS for that pass. It happens on
-1,696 of 1,696 passes that have a pivot. The ridge baseline does the same, and
-so does the gradient model with every duration halved; doubling them restores
-506 of the 1,247 placements. This is a property of under-prediction, not of
-these two models.
+The 24-hour perfect-information saving is `4.39%`, lower than the `7.10%` full-trace result because this cohort covers only the last ten days of the trace.
 
-The carbon-aware rows pay much less. At every budget the QoS gap between
-predicted and actual inputs is small — waiting mean +1.6% at six hours, +2.5%
-at twenty-four — because holding jobs for the grid signal dominates the
-schedule long before backfill does:
+### Prediction effects on EASY
 
-| delay budget | wait mean (s) actual | predicted | bsld mean actual | predicted | peak MW actual | predicted |
-| ------------ | -------------------: | --------: | ---------------: | --------: | -------------: | --------: |
-| 0 (= EASY)   |                422.9 |     458.3 |             2.11 |      3.00 |          0.850 |     0.844 |
-| 1 h          |              1,500.7 |   1,524.9 |            72.04 |     72.72 |          0.855 |     0.852 |
-| 3 h          |              5,013.8 |   5,036.9 |           310.42 |    312.26 |          0.850 |     0.858 |
-| 6 h          |              7,870.7 |   7,922.7 |           459.98 |    463.07 |          0.856 |     0.855 |
-| 12 h         |             12,140.3 |  12,400.4 |           656.74 |    674.84 |          0.856 |     0.874 |
-| 24 h         |             42,542.2 |  43,584.9 |         2,979.30 |  2,991.06 |          0.870 |     0.904 |
+Even at zero carbon delay, predictions change EASY placement.
 
-Peak power is the one place the model makes the concentration problem worse
-rather than merely smaller: 0.904 MW against 0.870 at the widest budget. Wrong
-durations aim jobs at the clean interval with the same enthusiasm and less
-accuracy about how long they will occupy it.
+| Input                       | Mean wait | Mean bounded slowdown |
+| --------------------------- | --------: | --------------------: |
+| Actual scheduling durations |   422.9 s |                  2.11 |
+| Predicted durations         |   458.3 s |                  3.00 |
 
-Energy is 67.52 MWh in every row of both halves, as it must be: the cohort and
-its measured profiles never change.
+With actual durations, EASY makes 1,247 placements that differ from FCFS. With predicted durations, it makes none: the resulting schedule is FCFS.
 
-## Interpreting the comparison
+The cause is runtime underprediction. The gradient model has:
 
-The original results remain the controlled clean-cohort experiment. The
-additional terminal-contention scenario schedules the same clean ids together
-with valid `FAILED`, `CANCELLED`, `TIMEOUT`, `OUT_OF_MEMORY` and `NODE_FAIL`
-executions. On the 5,000-job debug cohort this adds 2,227 jobs, raises EASY node
-utilisation from 9.7% to 20.6%, and raises mean clean-cohort waiting from 31.2 s
-to 87.8 s. This confirms that the extra records affect placement rather than
-only an offline occupancy calculation.
+- overall duration bias: `-568 s`;
+- bias for jobs ≥3 h: `-14,140 s`.
 
-The outcome remains counterfactual: rescheduling preserves each terminal job's
-observed duration and allocation but does not model why it failed or was
-cancelled. The exact selection rules, status counts and results are documented
-in [PM100 terminal-job contention](../../docs/PM100_features.md#terminal-job-contention-scenario).
+When projected completions fall at or before the current time while jobs are still running, EASY cannot form a reliable future reservation and falls back to strict FCFS for that pass.
+
+This happens on all 1,696 passes containing a pivot. The ridge baseline shows the same behavior. Artificially doubling predicted durations restores 506 of the 1,247 backfills, confirming that the effect is caused by underprediction rather than a model-specific code path.
+
+### Predicted-input QoS
+
+| Delay | Wait actual | Wait predicted | BSLD actual | BSLD predicted | Peak actual | Peak predicted |
+| ----- | ----------: | -------------: | ----------: | -------------: | ----------: | -------------: |
+| 0     |       422.9 |          458.3 |        2.11 |           3.00 |       0.850 |          0.844 |
+| 1 h   |     1,500.7 |        1,524.9 |       72.04 |          72.72 |       0.855 |          0.852 |
+| 3 h   |     5,013.8 |        5,036.9 |      310.42 |         312.26 |       0.850 |          0.858 |
+| 6 h   |     7,870.7 |        7,922.7 |      459.98 |         463.07 |       0.856 |          0.855 |
+| 12 h  |    12,140.3 |       12,400.4 |      656.74 |         674.84 |       0.856 |          0.874 |
+| 24 h  |    42,542.2 |       43,584.9 |    2,979.30 |       2,991.06 |       0.870 |          0.904 |
+
+Once carbon delay dominates the schedule, the additional QoS cost of prediction errors is relatively small.
+
+Peak concentration is more sensitive: at a 24-hour budget predicted inputs increase peak power from `0.870` to `0.904 MW`.
+
+Energy remains **67.52 MWh** in every row.
+
+## Terminal-job contention
+
+The main experiments use the clean completed-job cohort.
+
+An additional contention scenario schedules those jobs together with valid terminal executions:
+
+- `FAILED`
+- `CANCELLED`
+- `TIMEOUT`
+- `OUT_OF_MEMORY`
+- `NODE_FAIL`
+
+Terminal jobs retain their observed execution interval and node allocation but have no power profile.
+
+On the 5,000-job debug cohort, adding 2,227 terminal jobs:
+
+- increases node utilisation from 9.7% to 20.6%;
+- increases mean clean-job EASY waiting from 31.2 s to 87.8 s.
+
+These runs model additional resource contention, not the cause of cancellation or failure. Rescheduled terminal jobs retain their observed duration and allocation.
+
+Selection rules, status counts, and detailed results are documented in [PM100 terminal-job contention](../../docs/PM100_features.md#terminal-job-contention-scenario).

@@ -22,6 +22,7 @@ package-dir = { "" = "src" }
 packages = [
     "carbon_accounting",
     "carbon_intensity",
+    "experiments",
     "hpc_sim",
     "job_prediction",
 ]

@@ -1,17 +1,17 @@
-"""Small offline check: python -m carbon_intensity.check_forecasting."""
+"""Small offline check: python tests/check_carbon_intensity_forecasting.py."""
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .baselines import BASELINE_PERIODS, BaselineCarbonIntensityProvider as Baseline
-from .check_history import rejects
-from .evaluate import REPORTED_HORIZONS, evaluate_forecast
-from .features import FEATURE_NAMES, LOOKBACK, forecast_features, target_features
-from .forecasting import BUCKETS, FEATURE_LAYOUT, HORIZON, RidgeCarbonIntensityForecaster as Ridge
-from .series import CarbonIntensitySample as Sample
-from .protocol import TemporalProtocol
-from .series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
+from carbon_intensity.baselines import BASELINE_PERIODS, BaselineCarbonIntensityProvider as Baseline
+from check_carbon_intensity_history import rejects
+from carbon_intensity.evaluate import REPORTED_HORIZONS, evaluate_forecast
+from carbon_intensity.features import FEATURE_NAMES, LOOKBACK, forecast_features, target_features
+from carbon_intensity.forecasting import BUCKETS, FEATURE_LAYOUT, HORIZON, RidgeCarbonIntensityForecaster as Ridge
+from carbon_intensity.series import CarbonIntensitySample as Sample
+from carbon_intensity.protocol import TemporalProtocol
+from carbon_intensity.series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
 
 
 def main():

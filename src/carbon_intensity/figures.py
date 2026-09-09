@@ -29,6 +29,7 @@ LABELS = {
     "seasonal_weekly": "Weekly seasonal",
     "ridge_direct": "Ridge, frozen 2019",
     "ridge_refit_once": "Ridge, frozen pre-test",
+    "boosted_ridge": "Boosted ridge (selected)",
 }
 PREFIX = "ridge_refit_"
 

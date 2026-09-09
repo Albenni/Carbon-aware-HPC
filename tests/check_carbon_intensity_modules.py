@@ -1,45 +1,44 @@
-"""Run the ``carbon_intensity`` in-package checks under the single test command.
+"""Run the script-style ``carbon_intensity`` checks under the single test command.
 
-Those modules live next to the code they check and stay runnable on their own
-(``python -m carbon_intensity.check_baselines``) for focused debugging. This
-wrapper is what makes ``unittest discover -s tests`` the one command that runs
-everything, instead of six extra invocations nobody remembers.
+Each ``check_carbon_intensity_*`` module asserts its own invariants in a
+``main()`` and stays runnable on its own (``python
+tests/check_carbon_intensity_history.py``) for focused debugging. They carry no
+``TestCase``, so this wrapper is what makes ``unittest discover -s tests`` the
+one command that runs everything, instead of seven extra invocations nobody
+remembers.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
-from pathlib import Path
 import unittest
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-from carbon_intensity import (
-    check_baselines,
-    check_forecasting,
-    check_history,
-    check_scheduling_impact,
-    check_snapshots,
-    check_walkforward,
-)
+import check_carbon_intensity_baselines
+import check_carbon_intensity_boosted
+import check_carbon_intensity_forecasting
+import check_carbon_intensity_history
+import check_carbon_intensity_scheduling_impact
+import check_carbon_intensity_snapshots
+import check_carbon_intensity_walkforward
 
 
+# Ordered the way the pipeline is built: data, then baselines, then models.
 MODULES = (
-    check_history,
-    check_baselines,
-    check_forecasting,
-    check_snapshots,
-    check_walkforward,
-    check_scheduling_impact,
+    check_carbon_intensity_history,
+    check_carbon_intensity_baselines,
+    check_carbon_intensity_forecasting,
+    check_carbon_intensity_snapshots,
+    check_carbon_intensity_walkforward,
+    check_carbon_intensity_boosted,
+    check_carbon_intensity_scheduling_impact,
 )
 
 
-class InPackageChecks(unittest.TestCase):
+class ScriptStyleChecks(unittest.TestCase):
     """Each module asserts its own invariants and prints a summary line."""
 
-    def test_in_package_checks_pass(self) -> None:
+    def test_script_style_checks_pass(self) -> None:
         for module in MODULES:
             with self.subTest(module=module.__name__):
                 # The checks report by printing; keep the test output readable.

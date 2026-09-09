@@ -23,6 +23,7 @@ from pathlib import Path
 import sys
 
 from .baselines import BASELINE_PERIODS, BaselineCarbonIntensityProvider
+from .boosted import BoostedCarbonIntensityForecaster
 from .evaluate import load_inputs, selected
 from .forecasting import CADENCE, HORIZON, RidgeCarbonIntensityForecaster
 from .series import CarbonIntensityForecast, CarbonIntensitySample
@@ -270,6 +271,7 @@ def update_period(model_path: Path, fallback: timedelta) -> timedelta:
 def archive_models(
     actual: TimeSeriesCarbonIntensityProvider, protocol: TemporalProtocol, model_path: Path,
     partition: str = "test", refit: timedelta = timedelta(days=30),
+    only: Callable[[str], bool] = lambda name: True,
 ):
     """Yield each model behind the same provider call, with its provenance.
 
@@ -281,6 +283,8 @@ def archive_models(
     matrices, which is the expensive part.
     """
     for method in BASELINE_PERIODS:
+        if not only(method):
+            continue
         yield method, BaselineCarbonIntensityProvider(actual, protocol, method).get_forecast, {
             "model_version": None, "training_cutoff": None,
             "training_note": "unfitted baseline; no training data is involved",
@@ -289,23 +293,39 @@ def archive_models(
     if not model_path.exists():
         raise ValueError(f"{model_path} is missing; run carbon_intensity.evaluate to fit it")
     ridge = RidgeCarbonIntensityForecaster.load(model_path, actual, protocol)
-    yield ridge.metadata["model_name"], ridge.get_forecast, {
-        key: ridge.metadata[key] for key in (
-            "model_version", "alpha", "feature_names", "history_span_days", "lookback_hours",
-            "strategy", "training_cutoff", "training_available_at", "training_examples",
-            "training_window_start", "numpy_version", "sklearn_version",
-        )
-    } | {"model_path": str(model_path), "model_sha256": sha256(model_path.read_bytes()).hexdigest()}
+    if only(ridge.metadata["model_name"]):
+        yield ridge.metadata["model_name"], ridge.get_forecast, {
+            key: ridge.metadata[key] for key in (
+                "model_version", "alpha", "feature_names", "history_span_days", "lookback_hours",
+                "strategy", "training_cutoff", "training_available_at", "training_examples",
+                "training_window_start", "numpy_version", "sklearn_version",
+            )
+        } | {
+            "model_path": str(model_path),
+            "model_sha256": sha256(model_path.read_bytes()).hexdigest(),
+        }
     configuration = {"alpha": ridge.metadata["alpha"], "history_span": None} | selected(model_path)
     shared = {key: ridge.metadata[key] for key in (
         "feature_names", "lookback_hours", "numpy_version", "sklearn_version",
     )}
-    rows = pooled_design(actual, protocol)
-    for period in (None, update_period(model_path, refit)):
-        forecaster = WalkForwardForecaster.build(
-            actual, protocol, rows, replay=partition, period=period, **configuration,
-        )
-        yield forecaster.metadata["model_name"], forecaster.get_forecast, forecaster.metadata | shared
+    period = update_period(model_path, refit)
+    walkforward = [(None, "ridge_refit_once"), (period, f"ridge_refit_{period.days}d")]
+    if any(only(name) for _, name in walkforward):
+        rows = pooled_design(actual, protocol)
+        for period, name in walkforward:
+            if not only(name):
+                continue
+            forecaster = WalkForwardForecaster.build(
+                actual, protocol, rows, replay=partition, period=period, **configuration,
+            )
+            yield (forecaster.metadata["model_name"], forecaster.get_forecast,
+                   forecaster.metadata | shared)
+    # The boosted model refits nothing during the replay: validation put its
+    # walk-forward variant inside the margin, so the frozen fit is the one the
+    # scheduler gets.
+    if only("boosted_ridge"):
+        boosted = BoostedCarbonIntensityForecaster.build(actual, protocol, replay=partition)
+        yield boosted.metadata["model_name"], boosted.get_forecast, boosted.metadata
 
 
 def main() -> int:
@@ -322,11 +342,15 @@ def main() -> int:
     parser.add_argument("--cadence-minutes", type=int, default=60)
     parser.add_argument("--refit-days", type=int, default=30,
                         help="walk-forward period when validation kept the frozen model")
+    parser.add_argument("--only", nargs="+", metavar="MODEL",
+                        help="build archives for these model names only")
     args = parser.parse_args()
+    wanted = (lambda name: True) if not args.only else (lambda name: name in set(args.only))
     try:
         actual, protocol, actual_hash = load_inputs(args.actual, args.protocol)
         for name, get_forecast, provenance in archive_models(
             actual, protocol, args.model, args.partition, timedelta(days=args.refit_days),
+            wanted,
         ):
             archive = ForecastArchive.generate(
                 name, get_forecast, protocol, partition=args.partition,

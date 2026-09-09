@@ -1,4 +1,4 @@
-"""Small offline check: python -m carbon_intensity.check_history."""
+"""Small offline check: python tests/check_carbon_intensity_history.py."""
 
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -6,10 +6,10 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import FIFTEEN_MINUTES as STEP, CarbonIntensitySample as Sample
-from . import ElectricityMapsClient, TimeSeriesCarbonIntensityProvider as Series
-from .history import ACTUAL_METADATA, merge_actual_caches
-from .protocol import TemporalProtocol
+from carbon_intensity import FIFTEEN_MINUTES as STEP, CarbonIntensitySample as Sample
+from carbon_intensity import ElectricityMapsClient, TimeSeriesCarbonIntensityProvider as Series
+from carbon_intensity.history import ACTUAL_METADATA, merge_actual_caches
+from carbon_intensity.protocol import TemporalProtocol
 
 
 def rejects(action):

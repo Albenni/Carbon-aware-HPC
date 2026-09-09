@@ -1,4 +1,4 @@
-"""Small offline check: python -m carbon_intensity.check_baselines."""
+"""Small offline check: python tests/check_carbon_intensity_baselines.py."""
 
 from dataclasses import replace
 import csv
@@ -8,12 +8,12 @@ from math import isclose, sqrt
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .baselines import BaselineCarbonIntensityProvider as Baseline
-from .check_history import rejects
-from .evaluate import evaluate_forecast, write_evaluation
-from .series import CarbonIntensitySample as Sample
-from .protocol import TemporalProtocol
-from .series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
+from carbon_intensity.baselines import BaselineCarbonIntensityProvider as Baseline
+from check_carbon_intensity_history import rejects
+from carbon_intensity.evaluate import evaluate_forecast, write_evaluation
+from carbon_intensity.series import CarbonIntensitySample as Sample
+from carbon_intensity.protocol import TemporalProtocol
+from carbon_intensity.series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
 
 
 def main():
