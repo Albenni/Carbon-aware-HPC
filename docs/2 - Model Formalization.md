@@ -287,8 +287,10 @@ job, the choice is fixed at release. With actual future intensity this is the
 perfect-information benchmark of §2.7, and it is a benchmark rather than a
 bound: the policy optimises each job independently and ignores the contention
 its own decisions create, so every job aims at the same clean interval and the
-resulting queueing is a cost the greedy rule does not model. Establishing the
-true optimum is the task of the later optimisation formulation.
+resulting queueing is a cost the greedy rule does not model. The MILP in
+`src/experiments/milp.py` solves the same choice jointly and with proven
+optimality on small instances, which measures how far the greedy is from the
+optimum instead of assuming it.
 
 Policies are scored by one function on the same workload: total and per-job
 emissions, total energy, peak power, node utilisation, makespan, throughput,
@@ -298,9 +300,9 @@ bounded slowdown with the conventional ten-second floor.
 By varying the maximum delay, the frontier between emissions and QoS can be estimated
 without immediately introducing arbitrary weights between objectives. Tail statistics
 and maxima of waiting time or bounded slowdown should also be reported: an improved
-average may hide severely penalized jobs ([DIWS](preEditoriale.pdf), pp. 9–11). The full
-MILP/CP formulation and core- or GPU-specific constraints belong to the subsequent
-optimization phase.
+average may hide severely penalized jobs ([DIWS](preEditoriale.pdf), pp. 9–11). The
+node-count MILP formulation is in `src/experiments/milp.py`; core- or GPU-specific
+constraints remain future work.
 
 ### 2.7 Oracle, Predictions, and Evaluation
 

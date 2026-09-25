@@ -330,18 +330,37 @@ class ElectricityMapsClient:
         flow_traced: bool,
         include_estimated: bool,
     ) -> JsonObject:
+        return self.fetch_past_range(
+            "carbon-intensity",
+            start,
+            end,
+            zone=zone,
+            emissionFactorType=emission_factor_type,
+            flowTraced=str(flow_traced).lower(),
+            disableEstimations=str(not include_estimated).lower(),
+        )
+
+    def fetch_past_range(
+        self,
+        signal: str,
+        start: datetime,
+        end: datetime,
+        *,
+        zone: str = DEFAULT_ZONE,
+        **params: str,
+    ) -> JsonObject:
+        """One unvalidated 15-minute ``<signal>/past-range`` request, e.g. ``total-load``."""
+
         query = urlencode(
             {
                 "zone": zone,
                 "start": _iso_utc(start),
                 "end": _iso_utc(end),
                 "temporalGranularity": TEMPORAL_GRANULARITY,
-                "emissionFactorType": emission_factor_type,
-                "flowTraced": str(flow_traced).lower(),
-                "disableEstimations": str(not include_estimated).lower(),
+                **params,
             }
         )
-        url = f"{API_BASE_URL}/carbon-intensity/past-range?{query}"
+        url = f"{API_BASE_URL}/{signal}/past-range?{query}"
         return self._transport(url, {"auth-token": self._api_key})
 
     @staticmethod

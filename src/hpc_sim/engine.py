@@ -147,7 +147,9 @@ class Simulator:
             self._push(job.release_time, EventKind.RELEASE, job)
 
         first_event_time = self._events[0][0]
-        while self._events:
+        # Stop at the last completion: a wakeup a policy left behind for a queue
+        # that has since emptied would otherwise stretch the makespan.
+        while self._events and len(self._records) < len(self._jobs):
             now = self._events[0][0]
             self._advance_clock_to(now)
             self._drain_events_at(now)
@@ -200,6 +202,9 @@ class Simulator:
         # Completions first: nodes freed at `now` must be reusable at `now`.
         for job in completions:
             self._complete(job, now)
+        # Queue order, so a policy that decides job by job sees the same
+        # sequence however the input happened to be ordered.
+        releases.sort(key=lambda released: str(released.job_id))
         for job in releases:
             self._scheduler.on_release(job, now, self)
         self._queue.extend(releases)

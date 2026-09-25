@@ -7,6 +7,14 @@ from dataclasses import asdict, dataclass
 import numpy as np
 import pandas as pd
 
+from .data import (
+    AVERAGE_POWER_WATTS,
+    DURATION_SECONDS,
+    TemporalSplit,
+    completed_by,
+    require_columns,
+)
+
 
 # Reporting bands for actual duration. The last two split the ">=1 h" cohort
 # that carries almost all of the workload's runtime seconds, and therefore
@@ -118,3 +126,85 @@ def long_job_metrics(
         observed[selected],
         np.asarray(predicted, dtype=float)[selected],
     )
+
+
+def job_metric_row(frame, estimate, target, unit, predicted) -> dict[str, object]:
+    """The same overall and long-job metrics for learned and simple estimates."""
+
+    actual = frame[target].to_numpy(dtype=float)
+    durations = frame[DURATION_SECONDS].to_numpy(dtype=float)
+    long_count = int((durations >= LONG_JOB_SECONDS).sum())
+    long_jobs = (
+        long_job_metrics(actual, predicted, durations=durations) if long_count else None
+    )
+    return {
+        "estimate": estimate,
+        "target": target,
+        "unit": unit,
+        **regression_metrics(actual, predicted).as_row(),
+        "long_job_count": long_count,
+        "long_job_mae": long_jobs.mae if long_jobs else float("nan"),
+        "long_job_wape": (
+            long_jobs.weighted_absolute_relative_error if long_jobs else float("nan")
+        ),
+        "long_job_bias": long_jobs.bias if long_jobs else float("nan"),
+    }
+
+
+def runtime_band_metrics(actual: object, predicted: object) -> pd.DataFrame:
+    """Group only by actual seconds: [0,5m), [5m,30m), [30m,1h), [1h,4h], >4h."""
+
+    observed = np.asarray(actual, dtype=float)
+    estimates = np.asarray(predicted, dtype=float)
+    # Validate even if a malformed value would fall outside every band.
+    empty = {key: float("nan") for key in regression_metrics(observed, estimates).as_row()}
+    rows = []
+    for label, selected in (
+        ("< 5 min", observed < 300),
+        ("5–30 min", (observed >= 300) & (observed < 1_800)),
+        ("30–60 min", (observed >= 1_800) & (observed < 3_600)),
+        ("1–4 h", (observed >= 3_600) & (observed <= 14_400)),
+        ("> 4 h", observed > 14_400),
+    ):
+        values = observed[selected]
+        metrics = regression_metrics(values, estimates[selected]).as_row() if values.size else empty
+        rows.append({
+            "band": label, **metrics, "count": int(values.size),
+            "actual_runtime_mean_s": float(np.mean(values)) if values.size else float("nan"),
+            "actual_runtime_median_s": float(np.median(values)) if values.size else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
+def baseline_estimates(
+    split: TemporalSplit, *, runtime_by_nodes: bool = False, power_by_nodes: bool = False,
+) -> list[tuple]:
+    """Predict the unchanged test rows; fit medians only on observable train labels.
+
+    Allocated nodes are used only for the optional offline comparison, never
+    added to the submission-time models or scheduler inputs.
+    """
+
+    train = completed_by(split.train, split.train_until, period_name="training")
+    require_columns(train, (DURATION_SECONDS, AVERAGE_POWER_WATTS))
+    require_columns(split.test, ("time_limit",))
+    runtime = pd.to_numeric(split.test.time_limit, errors="raise").to_numpy(dtype=float) * 60.0
+    if not np.all(np.isfinite(runtime)) or not np.all(runtime > 0.0):
+        raise ValueError("time_limit * 60 must be finite and greater than zero")
+    estimates = [("time_limit * 60", DURATION_SECONDS, "s", runtime)]
+    for target, label, unit, grouped in (
+        (DURATION_SECONDS, "runtime", "s", runtime_by_nodes),
+        (AVERAGE_POWER_WATTS, "power", "W", power_by_nodes),
+    ):
+        values = pd.to_numeric(train[target], errors="raise").to_numpy(dtype=float)
+        if not np.all(np.isfinite(values)) or not np.all(values > 0.0):
+            raise ValueError(f"{target} must be finite and greater than zero")
+        median = float(np.median(values))
+        estimates.append((f"training median {label}", target, unit, np.full(len(split.test), median)))
+        if grouped:
+            require_columns(train, ("num_nodes_alloc",))
+            require_columns(split.test, ("num_nodes_alloc",))
+            medians = pd.Series(values).groupby(train.num_nodes_alloc, observed=True).median()
+            predicted = split.test.num_nodes_alloc.map(medians).fillna(median).to_numpy(dtype=float)
+            estimates.append((f"training median {label} by nodes", target, unit, predicted))
+    return estimates

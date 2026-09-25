@@ -23,10 +23,9 @@ from job_prediction import (
     banded_metrics,
     fit_job_predictor,
     load_job_data,
-    long_job_metrics,
-    regression_metrics,
     temporal_split,
 )
+from job_prediction.evaluation import baseline_estimates, job_metric_row
 from job_prediction.features import FeatureSpec
 from job_prediction.gradient import TargetConfig, fit_gradient_predictor
 from common import PROJECT_ROOT
@@ -95,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _metric_rows(frame, components, scheduling, composition) -> list[dict[str, object]]:
+def _metric_rows(frame, components, scheduling, composition, baselines=()) -> list[dict[str, object]]:
     estimates: list[tuple[str, str, str, object]] = [
         ("duration model", DURATION_SECONDS, "s", components[DURATION_SECONDS]),
         (
@@ -125,25 +124,7 @@ def _metric_rows(frame, components, scheduling, composition) -> list[dict[str, o
             )
         )
 
-    durations = frame[DURATION_SECONDS].to_numpy(dtype=float)
-    rows: list[dict[str, object]] = []
-    for estimate, target, unit, predicted in estimates:
-        actual = frame[target].to_numpy(dtype=float)
-        metrics = regression_metrics(actual, predicted)
-        long_jobs = long_job_metrics(actual, predicted, durations=durations)
-        rows.append(
-            {
-                "estimate": estimate,
-                "target": target,
-                "unit": unit,
-                **metrics.as_row(),
-                "long_job_count": long_jobs.count,
-                "long_job_mae": long_jobs.mae,
-                "long_job_wape": long_jobs.weighted_absolute_relative_error,
-                "long_job_bias": long_jobs.bias,
-            }
-        )
-    return rows
+    return [job_metric_row(frame, *estimate) for estimate in [*estimates, *baselines]]
 
 
 def _band_rows(frame, components) -> "list[dict[str, object]]":
@@ -283,6 +264,10 @@ def _write_outputs(arguments, split, training, rows, bands, predictions):
             writer = csv.DictWriter(handle, fieldnames=list(table[0]))
             writer.writeheader()
             writer.writerows(table)
+    for target, name in ((DURATION_SECONDS, "runtime"), (AVERAGE_POWER_WATTS, "power")):
+        pd.DataFrame([row for row in rows if row["target"] == target]).to_csv(
+            output_dir / f"test_{name}_comparison.csv", index=False
+        )
     return model_path, predictions_path, metrics_path
 
 
@@ -335,7 +320,8 @@ def main() -> int:
         )
     components, scheduling = _test_estimates(arguments, data, split, training)
     rows = _metric_rows(
-        split.test, components, scheduling, training.predictor.composition
+        split.test, components, scheduling, training.predictor.composition,
+        baselines=baseline_estimates(split, runtime_by_nodes="num_nodes_alloc" in data),
     )
     bands = _band_rows(split.test, components)
     _print_report(arguments, split, training, rows)

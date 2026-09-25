@@ -5,12 +5,13 @@ import io
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from math import isclose, isnan
 
 from carbon_accounting import JobPowerProfile
 from carbon_intensity.series import CarbonIntensityForecast, CarbonIntensitySample as Sample
 from carbon_intensity.series import FIFTEEN_MINUTES as STEP, TimeSeriesCarbonIntensityProvider as Series
 from carbon_intensity.snapshots import ForecastArchive
-from experiments.ablation import compare
+from experiments.ablation import DEFAULT_DELAYS, compare, delay_sweep
 
 
 BASE = datetime(2020, 5, 6, tzinfo=timezone.utc)
@@ -77,6 +78,29 @@ def main() -> None:
     # The submit-time view is reported alongside the release-time one and,
     # with release == submit here, has to agree with it.
     assert realistic["submit_waiting_mean_s"] == realistic["waiting_mean_s"]
+
+    sweep = list(delay_sweep(jobs, predicted, actual, perfect, nodes=2))
+    assert len(sweep) == 4 * len(DEFAULT_DELAYS)
+    assert {row["max_delay_hours"] for row in sweep} == set(DEFAULT_DELAYS)
+    references = {row["easy_reference_emissions_tco2e"] for row in sweep}
+    assert len(references) == 1
+    reference = references.pop()
+    for hours in DEFAULT_DELAYS:
+        selected = [row for row in sweep if row["max_delay_hours"] == hours]
+        assert {row["information_configuration"][0] for row in selected} == set("ABCD")
+        perfect_row = next(row for row in selected if row["information_configuration"].startswith("A_"))
+        saving = reference - perfect_row["total_emissions_tco2e"]
+        for row in selected:
+            assert row["jobs"] == len(jobs) and row["nodes"] == 2
+            assert row["forecast_reach_hours"] == 23.0
+            assert row["decision_granularity_minutes"] == 15.0
+            assert isclose(row["emissions_saved_tco2e"], reference - row["total_emissions_tco2e"], abs_tol=1e-12)
+            if saving == 0:
+                assert isnan(row["carbon_benefit_retained"])
+            else:
+                assert isclose(row["carbon_benefit_retained"], row["emissions_saved_tco2e"] / saving)
+        if hours == 0:
+            assert saving == 0
 
     print("Information ablation checks passed.")
 

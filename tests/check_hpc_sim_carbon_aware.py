@@ -27,7 +27,6 @@ from carbon_accounting import JobPowerProfile, carbon_emissions
 from carbon_intensity import (
     CarbonIntensityForecast,
     CarbonIntensitySample,
-    ForecastUnavailableError,
     MissingCarbonIntensityError,
     TimeSeriesCarbonIntensityProvider,
 )
@@ -457,17 +456,16 @@ class ForecastCarbonAwareSchedulerTest(unittest.TestCase):
         self.assertEqual(start_times(run(jobs, scheduler)), start_times(easy))
         self.assertEqual(dict(scheduler.forecast_issue_times), {})
 
-    def test_a_window_the_archive_cannot_cover_is_refused(self) -> None:
+    def test_a_window_the_archive_cannot_cover_is_offered_to_easy(self) -> None:
         # A 24-hour trajectory issued at release cannot score a 20-hour budget
-        # on top of a 10-hour job, and inventing the tail is not an option.
+        # on top of a 10-hour job, and inventing the tail is not an option: the
+        # job is offered to EASY at once and the reason is recorded.
         job = make_job("long", duration_seconds=36_000)
-        with self.assertRaises(ForecastUnavailableError):
-            run(
-                [job],
-                CarbonAwareScheduler(
-                    sealed_archive(CLEAN_FROM), forecast=True, max_delay=timedelta(hours=20)
-                ),
-            )
+        scheduler = CarbonAwareScheduler(
+            sealed_archive(CLEAN_FROM), forecast=True, max_delay=timedelta(hours=20)
+        )
+        self.assertEqual(start_times(run([job], scheduler))["long"], BASE)
+        self.assertEqual(scheduler.decision_records()[0]["reason"], "forecast-unavailable")
 
 
 if __name__ == "__main__":

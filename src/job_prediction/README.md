@@ -434,7 +434,87 @@ job_models.json
 test_predictions.parquet
 test_metrics.csv
 test_duration_bands.csv
+test_runtime_comparison.csv
+test_power_comparison.csv
 ```
+
+The trainer also scores `time_limit * 60`, global training medians for runtime
+and average job power, and runtime medians by `num_nodes_alloc` when that column
+is available. All medians use only training jobs whose `end_time <= train_until`;
+validation and test outcomes never enter baseline fitting, even though the
+learned models retain their existing development-period refit. Missing or unseen
+node groups fall back to the corresponding global training median.
+
+Compare both saved job models and all saved CI forecasts without retraining:
+
+```bash
+.venv/bin/python scripts/compare_prediction_baselines.py
+# Also run all four scheduler information configurations at 0, 1, 3, 6, 12, 24 h:
+.venv/bin/python scripts/compare_prediction_baselines.py --scheduler-sweep
+```
+
+Outputs in `data/prediction_baselines/`:
+
+| File | Contents |
+| --- | --- |
+| `test_runtime_comparison.csv` | Walltime limit, global/node-group training medians, ridge, gradient |
+| `test_runtime_band_comparison.csv` | Runtime errors and actual mean/median, by actual-duration band |
+| `test_power_comparison.csv` | Global/node-group training medians, ridge, gradient |
+| `test_carbon_intensity_comparison.csv` | Overall CI errors for causal baselines and saved forecasts |
+| `test_carbon_intensity_horizon_comparison.csv` | CI errors for 0–1, 1–3, 3–6, 6–12, 12–24 h leads |
+| `test_scheduler_information_comparison.csv` | Four configurations × six delay budgets, with `--scheduler-sweep` |
+| `comparison_metadata.json` | Cutoffs, fit counts, baseline medians, CI protocol, scheduler settings |
+| `comparison_summary.txt` | Model/baseline comparison, lowest CI errors, realistic carbon retention |
+
+Job comparisons use `test_predictions.parquet` and reject mismatched job IDs
+or split metadata; use repeatable `--job-run LABEL=DIRECTORY` for other runs.
+These are the saved runtime and power estimates, including composed power if
+the learned model selected duration+energy. Each target keeps its existing
+temporal test set; the job and CI test periods need not coincide.
+
+Node-group medians are offline allocation-conditioned comparisons; allocation
+is not added to submission-time model features. Grouped power is enabled by
+default; the existing `--power-by-nodes` flag still works, and
+`--no-power-by-nodes` omits it.
+
+`bias` is mean(prediction − actual), in seconds or watts; `relative_bias` is
+sum(prediction − actual) / sum(actual). WARE uses the absolute-error sum over
+the same denominator. Duration bands use **actual runtime only**:
+`[0,300)`, `[300,1800)`, `[1800,3600)`, `[3600,14400]`, and `(14400,∞)` seconds.
+Empty bands have count zero and blank metrics. Band assignment affects reporting
+only. The power target remains the duration-weighted measured job-power mean.
+
+Persistence, daily seasonal, and weekly seasonal CI forecasts are recomputed
+causally, using only observations available at each issue time (bucket end plus
+publication delay). They share the archived models' issue times, protocol,
+future observations, and evaluator. CI lead bands use the target **bucket end**,
+with bounds `(0,1]`, `(1,3]`, `(3,6]`, `(6,12]`, `(12,24]` hours. Count means
+issue/target pairs; overlapping forecasts count separately. CI relative bias
+and WARE are null when the actual sum is zero. Horizon RMSE comes from pooled
+squared errors, not an average of per-lead RMSEs.
+
+The scheduler sweep reuses `experiments.ablation`: A = actual jobs/actual CI,
+B = predicted jobs/actual CI, C = actual jobs/forecast CI, D = predicted
+jobs/forecast CI. Defaults remain gradient job predictions, the existing
+`boosted_ridge` archive, 880 nodes, and a 15-minute decision grid; use
+`--scheduler-job-model`, `--scheduler-archive`, `--nodes`,
+`--decision-granularity-minutes`, or `--max-delay-hours` to set the shared
+experiment before running. Test errors never choose these settings.
+
+Every run executes with true durations and accounts measured power profiles
+against actual CI. The existing scheduler still plans with average job power.
+All configurations retain the same forecast reach (24 h horizon − 1 h cadence
+= 23 h for the default archive), so effective voluntary delay is at most
+`min(max_delay, max(reach − scheduling_runtime, 0))`. Waiting time can exceed
+that voluntary budget because of contention. Main waiting/slowdown columns use
+release time, and `submit_...` columns give the submission-time view. Peak power
+is the existing aggregate job-average-power estimate.
+
+Every saving uses the **same actual-job EASY reference**. At each delay,
+`carbon_benefit_retained = (EASY − scenario) / (EASY − A)`, with null/NaN when
+the denominator is zero. Negative values are retained: they mean the scenario
+emits more than EASY when perfect-information saving is positive. Scheduler
+algorithms, ML architectures, split boundaries, and power targets are unchanged.
 
 `job_models.json` records feature definitions, transforms, split boundaries, and hyperparameters.
 

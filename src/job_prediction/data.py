@@ -164,10 +164,12 @@ def load_job_data(
     if missing:
         raise ValueError(f"{source} is missing columns: {', '.join(sorted(missing))}")
 
+    # Evaluation-only grouping; allocation never enters SUBMISSION_FEATURES.
+    allocation = ["num_nodes_alloc"] if "num_nodes_alloc" in parquet_file.schema_arrow.names else []
     frames: list[pd.DataFrame] = []
     for batch in parquet_file.iter_batches(
         batch_size=batch_size,
-        columns=list(_SOURCE_COLUMNS),
+        columns=[*_SOURCE_COLUMNS, *allocation],
     ):
         job_ids = batch[JOB_ID].to_pylist()
         durations = batch["run_time"].to_pylist()
@@ -177,7 +179,7 @@ def load_job_data(
             batch["node_power_consumption"].to_pylist(),
         )
         features = pyarrow.Table.from_batches([batch]).select(
-            [JOB_ID, *SUBMISSION_COLUMNS, COMPLETION_TIME]
+            [JOB_ID, *SUBMISSION_COLUMNS, COMPLETION_TIME, *allocation]
         ).to_pandas()
         features[DURATION_SECONDS] = durations
         features[AVERAGE_POWER_WATTS] = powers

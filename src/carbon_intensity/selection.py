@@ -128,10 +128,10 @@ def score(candidate: Candidate, predicted: np.ndarray, labels: np.ndarray, used:
     return {
         **candidate.describe(), "partition": "validation", "forecasts": error.shape[0],
         "training_rows": used[0], "training_rows_final": used[-1], "fits": len(used),
-        **error_metrics(totals(error, error.size)),
+        **error_metrics([*totals(error, error.size), float(labels.sum())]),
         "by_horizon": [
             {"lead_hours": (bucket + 1) * STEP.total_seconds() / 3600,
-             **error_metrics(totals(column, error.shape[0]))}
+             **error_metrics([*totals(column, error.shape[0]), float(labels[:, bucket].sum())])}
             for bucket, column in enumerate(error.T)
         ],
         "by_month": [], "by_hour": [],

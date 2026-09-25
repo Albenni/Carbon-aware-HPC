@@ -3,7 +3,9 @@
 from .carbon_aware import (
     CarbonAwareScheduler,
     CarbonSignal,
+    CongestionAwareRecedingScheduler,
     PowerCappedCarbonAwareScheduler,
+    RecedingHorizonCarbonAwareScheduler,
     carbon_cost_gco2e,
     cheapest_start_time,
 )
@@ -42,6 +44,7 @@ __all__ = [
     "CarbonAwareScheduler",
     "CarbonSignal",
     "Cluster",
+    "CongestionAwareRecedingScheduler",
     "CoverageError",
     "Distribution",
     "EASYBackfillScheduler",
@@ -49,6 +52,7 @@ __all__ = [
     "Job",
     "PowerCappedCarbonAwareScheduler",
     "PowerCappedEASYScheduler",
+    "RecedingHorizonCarbonAwareScheduler",
     "RuntimeEstimateSource",
     "ScheduleMetrics",
     "Scheduler",

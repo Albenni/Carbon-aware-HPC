@@ -47,11 +47,13 @@ from hpc_sim import (
     PM100_PARTITION_1_NODES,
     CarbonAwareScheduler,
     Cluster,
+    CongestionAwareRecedingScheduler,
     EASYBackfillScheduler,
     FCFSScheduler,
     Job,
     PowerCappedCarbonAwareScheduler,
     PowerCappedEASYScheduler,
+    RecedingHorizonCarbonAwareScheduler,
     RuntimeEstimateSource,
     ScheduleMetrics,
     Simulator,
@@ -88,6 +90,10 @@ IDENTITY_FIELDS: tuple[str, ...] = (
     "forecast_reach_hours",
     "power_cap_mw",
     "decision_granularity_minutes",
+    "objective",
+    "delay_price_gco2e_per_hour",
+    "min_carbon_saving_per_delay",
+    "max_delay_cap_hours",
 )
 
 #: Each of these needs a second run to mean anything, so they are filled in
@@ -249,7 +255,18 @@ def compare(
         if arguments.decision_granularity_minutes is not None
         else provider.granularity.total_seconds() / 60.0
     )
-    shared = {"decision_granularity": decision_granularity, "runtime_estimate": estimate}
+    shared = {
+        "decision_granularity": decision_granularity,
+        "runtime_estimate": estimate,
+        "objective": arguments.objective,
+        "delay_price_gco2e_per_hour": arguments.delay_price_gco2e_per_hour,
+        "min_carbon_saving_per_delay": arguments.min_carbon_saving_per_delay,
+    }
+    scoring = {
+        "objective": arguments.objective,
+        "delay_price_gco2e_per_hour": arguments.delay_price_gco2e_per_hour,
+        "min_carbon_saving_per_delay": arguments.min_carbon_saving_per_delay,
+    }
 
     # Every archive is scored under one reach, and so is the oracle each one is
     # compared against: otherwise two runs would differ in their delay budget as
@@ -267,11 +284,15 @@ def compare(
             )
         )
     if arguments.max_delay_fraction is not None:
+        cap = arguments.max_delay_cap_hours
         families.append(
             (
                 "duration-scaled",
-                {"max_delay_fraction": arguments.max_delay_fraction},
-                {"max_delay_fraction": arguments.max_delay_fraction},
+                {
+                    "max_delay_fraction": arguments.max_delay_fraction,
+                    "max_delay_cap": None if cap is None else timedelta(hours=cap),
+                },
+                {"max_delay_fraction": arguments.max_delay_fraction, "max_delay_cap_hours": cap or ""},
             )
         )
 
@@ -308,6 +329,7 @@ def compare(
                 **arm,
                 "delay_policy": delay_policy,
                 "decision_granularity_minutes": granularity_minutes,
+                **scoring,
                 **recorded,
             }
             # Perfect knowledge of the future grid, unbounded: how much carbon
@@ -351,25 +373,46 @@ def compare(
             rows[-1]["oracle_recovery"] = 1.0
             available = easy.total_emissions_gco2e - bounded.total_emissions_gco2e
             for label, archive in archives.items():
-                metrics = add(
-                    CarbonAwareScheduler(
-                        ArchiveCarbonIntensityProvider(provider, archive),
-                        forecast=True,
-                        reach=reach,
-                        **shared,
-                        **options,
-                    ),
-                    jobs,
-                    scheduler_family="carbon",
-                    carbon_information="forecast",
-                    forecast_model=label,
-                    forecast_reach_hours=reach_hours,
-                    **budget,
-                )
-                if available > 0.0:
-                    rows[-1]["oracle_recovery"] = (
-                        easy.total_emissions_gco2e - metrics.total_emissions_gco2e
-                    ) / available
+                # The same policy, deciding once at release and again whenever
+                # the archive reissues: one row each, so the difference between
+                # them is the revisiting and nothing else.
+                policies = [(CarbonAwareScheduler, {})]
+                if arguments.receding_horizon:
+                    policies.append((RecedingHorizonCarbonAwareScheduler, {}))
+                if arguments.congestion_price is not None:
+                    policies.append(
+                        (
+                            CongestionAwareRecedingScheduler,
+                            {
+                                "congestion_price": arguments.congestion_price,
+                                "congestion_scope": arguments.congestion_scope,
+                                "replan_on_events": arguments.replan_on_events,
+                                "planning_jobs": arguments.planning_jobs,
+                                "overrun_to_horizon": arguments.overrun_to_horizon,
+                            },
+                        )
+                    )
+                for policy, extra in policies:
+                    metrics = add(
+                        policy(
+                            ArchiveCarbonIntensityProvider(provider, archive),
+                            forecast=True,
+                            reach=reach,
+                            **shared,
+                            **options,
+                            **extra,
+                        ),
+                        jobs,
+                        scheduler_family="carbon",
+                        carbon_information="forecast",
+                        forecast_model=label,
+                        forecast_reach_hours=reach_hours,
+                        **budget,
+                    )
+                    if available > 0.0:
+                        rows[-1]["oracle_recovery"] = (
+                            easy.total_emissions_gco2e - metrics.total_emissions_gco2e
+                        ) / available
 
     for row in rows:
         reference = easy_by_arm[(row["job_information"], row["job_model"])]
@@ -500,6 +543,73 @@ def build_parser() -> argparse.ArgumentParser:
             "like-for-like ratio. Pair it with the --carbon-cache it was "
             "generated against (data/carbon_intensity/actual/actual.json)"
         ),
+    )
+    parser.add_argument(
+        "--receding-horizon",
+        action="store_true",
+        help=(
+            "also run each forecast archive through the receding-horizon "
+            "policy, which revisits a job's carbon target whenever a newer "
+            "snapshot has been issued, inside the delay budget it already had"
+        ),
+    )
+    parser.add_argument(
+        "--congestion-price",
+        type=float,
+        default=None,
+        metavar="GCO2E_PER_KWH",
+        help=(
+            "also run each forecast archive through the congestion-aware "
+            "receding policy at this price (1 is the development-selected "
+            "value), which charges projected node overflow and lets the jobs "
+            "with the largest predicted carbon opportunity claim clean windows first"
+        ),
+    )
+    parser.add_argument(
+        "--objective",
+        choices=("carbon", "carbon-delay", "benefit-rate"),
+        default="carbon",
+        help="how every carbon-aware policy scores a candidate start (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--delay-price-gco2e-per-hour",
+        type=float,
+        default=0.0,
+        help="carbon-delay: gCO2e charged per job-hour of added delay",
+    )
+    parser.add_argument(
+        "--min-carbon-saving-per-delay",
+        type=float,
+        default=0.0,
+        help="gCO2e per job-hour a deferral must save to be admissible",
+    )
+    parser.add_argument(
+        "--max-delay-cap-hours",
+        type=float,
+        default=None,
+        help="cap on the duration-scaled budget, in hours",
+    )
+    parser.add_argument(
+        "--congestion-scope",
+        choices=("start", "interval"),
+        default="start",
+        help="congestion price read at the start instant or over the estimated run",
+    )
+    parser.add_argument(
+        "--replan-on-events",
+        action="store_true",
+        help="congestion policy: also replan on releases, completions and overruns",
+    )
+    parser.add_argument(
+        "--planning-jobs",
+        type=int,
+        default=None,
+        help="congestion policy: deferrable jobs coordinated per replan (default: all)",
+    )
+    parser.add_argument(
+        "--overrun-to-horizon",
+        action="store_true",
+        help="congestion policy: an overrunning job holds its nodes to the end of the plan",
     )
     parser.add_argument("--no-replay", action="store_true", help="skip the trace replay")
     parser.add_argument(

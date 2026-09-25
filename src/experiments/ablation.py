@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import timedelta
+from math import isfinite
 from pathlib import Path
 import sys
 
@@ -69,6 +70,14 @@ DEFAULT_PREDICTIONS = PROJECT_ROOT / "data/job_predictions/test_predictions.parq
 DEFAULT_ACTUAL = PROJECT_ROOT / "data/carbon_intensity/actual/actual.json"
 DEFAULT_SNAPSHOTS = PROJECT_ROOT / "data/carbon_intensity/snapshots"
 DEFAULT_OUTPUT = PROJECT_ROOT / "data/experiments"
+DEFAULT_ARCHIVE = "boosted_ridge"
+DEFAULT_DELAYS = (0.0, 1.0, 3.0, 6.0, 12.0, 24.0)
+INFORMATION_CONFIGURATIONS = {
+    ("actual", "actual"): "A_perfect_information",
+    ("predicted", "actual"): "B_job_model_error_only",
+    ("actual", "forecast"): "C_forecast_error_only",
+    ("predicted", "forecast"): "D_realistic",
+}
 
 #: The cells, in the order the report reads best: best information first.
 CELLS = (("actual", "actual"), ("actual", "forecast"), ("predicted", "actual"),
@@ -84,17 +93,22 @@ def _run(jobs: tuple[Job, ...], nodes: int, scheduler, actual) -> SimulationResu
     return account_schedule(Simulator(jobs, Cluster(nodes), scheduler).run(), jobs, actual)
 
 
-def _check_causal(scheduler: CarbonAwareScheduler, jobs: tuple[Job, ...]) -> None:
-    """Every decision must have read a forecast published before its own release."""
+def _check_causal(scheduler: CarbonAwareScheduler) -> None:
+    """Every decision must have read a forecast issued by its own decision time.
 
-    released = {job.job_id: job.release_time for job in jobs}
+    A policy that replans decides after release too, so the release is the
+    wrong reference. Every consultation is also refused as it happens when the
+    snapshot postdates it; this re-checks the recorded decisions after the run.
+    """
+
     late = [
-        job_id
-        for job_id, issue in scheduler.forecast_issue_times.items()
-        if issue > released[job_id]
+        record["job_id"]
+        for record in scheduler.decision_records()
+        if record["forecast_issue_time"] is not None
+        and record["forecast_issue_time"] > record["decision_time"]
     ]
     if late:
-        raise AssertionError(f"{len(late)} decisions read a forecast issued after release")
+        raise AssertionError(f"{len(late)} decisions read a forecast issued after they were taken")
 
 
 def compare(
@@ -106,6 +120,7 @@ def compare(
     nodes: int = PM100_PARTITION_1_NODES,
     max_delay: timedelta = timedelta(hours=6),
     granularity: timedelta = timedelta(minutes=15),
+    easy_runs: dict[tuple[str, str], SimulationResult] | None = None,
 ) -> list[dict[str, object]]:
     """Score the four cells, plus a carbon-blind run per cohort, on one protocol."""
 
@@ -120,11 +135,12 @@ def compare(
     cohorts = {"actual": actual_jobs, "predicted": predicted_jobs}
     providers = {"actual": actual, "forecast": ArchiveCarbonIntensityProvider(actual, archive)}
 
-    runs: dict[tuple[str, str], SimulationResult] = {}
-    for job_information, jobs in cohorts.items():
-        runs[job_information, "none"] = _run(
+    runs = dict(easy_runs) if easy_runs is not None else {
+        (information, "none"): _run(
             jobs, nodes, EASYBackfillScheduler(runtime_estimate=estimate), actual
         )
+        for information, jobs in cohorts.items()
+    }
     for job_information, carbon_information in CELLS:
         scheduler = CarbonAwareScheduler(
             providers[carbon_information],
@@ -136,7 +152,7 @@ def compare(
         )
         result = _run(cohorts[job_information], nodes, scheduler, actual)
         if carbon_information == "forecast":
-            _check_causal(scheduler, cohorts[job_information])
+            _check_causal(scheduler)
         runs[job_information, carbon_information] = result
 
     metrics = {cell: schedule_metrics(result) for cell, result in runs.items()}
@@ -175,8 +191,11 @@ def compare(
             "decision_granularity_minutes": (
                 granularity / timedelta(minutes=1) if carbon_aware else 0.0
             ),
-            "emissions_saved_vs_easy": saved / reference,
+            "easy_reference_emissions_tco2e": reference / 1e6,
+            "emissions_saved_tco2e": saved / 1e6,
+            "emissions_saved_vs_easy": saved / reference if reference else float("nan"),
             "oracle_recovery": saved / available if available else float("nan"),
+            "carbon_benefit_retained": saved / available if available else float("nan"),
             **metrics[cell].as_row(),
             **{
                 f"submit_{key}": value
@@ -186,6 +205,35 @@ def compare(
         }
         rows.append(row | attribution if cell == ("predicted", "forecast") else row)
     return rows
+
+
+def delay_sweep(
+    actual_jobs, predicted_jobs, actual, archive, *,
+    delay_hours=DEFAULT_DELAYS, nodes=PM100_PARTITION_1_NODES,
+    granularity=timedelta(minutes=15),
+):
+    """Yield the four information configurations per budget, sharing one EASY reference.
+
+    The two carbon-blind simulations are reused across budgets. As in compare(),
+    every saving uses actual-job EASY, including the predicted-job scenarios.
+    """
+
+    if not delay_hours or any(not isfinite(hours) or hours < 0 for hours in delay_hours):
+        raise ValueError("delay budgets must be finite, nonnegative, and nonempty")
+    easy_runs = {
+        (information, "none"): _run(jobs, nodes, EASYBackfillScheduler(
+            runtime_estimate=RuntimeEstimateSource.SCHEDULING,
+        ), actual)
+        for information, jobs in (("actual", actual_jobs), ("predicted", predicted_jobs))
+    }
+    for hours in delay_hours:
+        rows = compare(actual_jobs, predicted_jobs, actual, archive, nodes=nodes,
+                       max_delay=timedelta(hours=hours), granularity=granularity,
+                       easy_runs=easy_runs)
+        for row in rows:
+            key = row["job_information"], row["carbon_information"]
+            if key in INFORMATION_CONFIGURATIONS:
+                yield {"information_configuration": INFORMATION_CONFIGURATIONS[key], **row}
 
 
 def _report(rows: list[dict[str, object]]) -> None:
@@ -219,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--actual", type=Path, default=DEFAULT_ACTUAL)
     parser.add_argument("--snapshots", type=Path, default=DEFAULT_SNAPSHOTS)
     parser.add_argument("--partition", default="test")
-    parser.add_argument("--archive", default="boosted_ridge",
+    parser.add_argument("--archive", default=DEFAULT_ARCHIVE,
                         help="forecast archive to replay; the model selected in "
                              "results/forecast_results.md, best on validation and on test")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)

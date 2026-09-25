@@ -24,15 +24,21 @@ from .series import (
 REPORTED_HORIZONS = (1.0, 3.0, 6.0, 12.0, 24.0)
 # Baselines first, then fitted models, so tables read in order of sophistication.
 MODEL_ORDER = ("persistence", "seasonal_daily", "seasonal_weekly", "ridge_direct")
+HORIZON_BANDS = (("0–1 h", 0, 1), ("1–3 h", 1, 3), ("3–6 h", 3, 6),
+                 ("6–12 h", 6, 12), ("12–24 h", 12, 24))
 
 
 def error_metrics(totals: list) -> dict:
-    count, absolute_error, squared_error, signed_error = totals
+    count, absolute_error, squared_error, signed_error = totals[:4]
+    actual_sum = totals[4] if len(totals) > 4 else None
     return {
+        "count": count,
         "predicted_buckets": count,
         "mae_gco2e_per_kwh": absolute_error / count,
         "rmse_gco2e_per_kwh": sqrt(squared_error / count),
         "bias_gco2e_per_kwh": signed_error / count,
+        "weighted_absolute_relative_error": absolute_error / actual_sum if actual_sum else None,
+        "relative_bias": signed_error / actual_sum if actual_sum else None,
     }
 
 
@@ -59,10 +65,11 @@ def evaluate_forecast(
     issue_time, end = protocol.intervals[partition]
     label_delay = protocol.observation_delay if partition == "validation" else timedelta(0)
     first_issue = issue_time
-    totals = [0, 0.0, 0.0, 0.0]
-    by_horizon = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
-    by_month = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
-    by_hour = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
+    totals = [0, 0.0, 0.0, 0.0, 0.0]
+    by_horizon = defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0.0])
+    by_horizon_band = defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0.0])
+    by_month = defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0.0])
+    by_hour = defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0.0])
     forecasts = 0
     while issue_time + horizon + label_delay <= end:
         forecast = get_forecast(issue_time, horizon)
@@ -75,11 +82,17 @@ def evaluate_forecast(
         for predicted, observed in zip(forecast.samples, example.targets, strict=True):
             error = predicted.intensity_gco2e_per_kwh - observed.intensity_gco2e_per_kwh
             lead_hours = (observed.timestamp + FIFTEEN_MINUTES - issue_time).total_seconds() / 3600
-            for group in (totals, by_horizon[lead_hours], monthly, by_hour[observed.timestamp.hour]):
+            groups = [totals, by_horizon[lead_hours], monthly, by_hour[observed.timestamp.hour]]
+            for label, lower, upper in HORIZON_BANDS:
+                if lower < lead_hours <= upper:
+                    groups.append(by_horizon_band[label])
+                    break
+            for group in groups:
                 group[0] += 1
                 group[1] += abs(error)
                 group[2] += error * error
                 group[3] += error
+                group[4] += observed.intensity_gco2e_per_kwh
         forecasts += 1
         issue_time += cadence
     if not forecasts:
@@ -92,6 +105,8 @@ def evaluate_forecast(
         "cadence_minutes": cadence.total_seconds() / 60,
         **error_metrics(totals),
         "by_horizon": [{"lead_hours": lead, **error_metrics(group)} for lead, group in sorted(by_horizon.items())],
+        "by_horizon_band": [{"horizon_band": label, **error_metrics(group)}
+                            for label, group in by_horizon_band.items()],
         "by_month": [{"issue_month": month, **error_metrics(group)} for month, group in sorted(by_month.items())],
         "by_hour": [{"target_hour_utc": hour, **error_metrics(group)} for hour, group in sorted(by_hour.items())],
     }
@@ -115,7 +130,10 @@ def forecasters(
     yield ridge.metadata["model_name"], ridge.get_forecast, ridge.metadata["training_cutoff"]
 
 
-def archived_forecasters(directory: Path, partition: str):
+def archived_forecasters(
+    directory: Path, partition: str, *,
+    protocol: TemporalProtocol | None = None, actual_hash: str | None = None,
+):
     """Yield each saved archive, so the scored forecasts are the replayed ones.
 
     On the shared hourly grid an archive answers ``get_forecast`` exactly as the
@@ -132,6 +150,14 @@ def archived_forecasters(directory: Path, partition: str):
         raise ValueError(f"{directory} holds no {partition} forecast archives")
     for path in paths:
         archive = ForecastArchive.load(path)
+        if archive.metadata["partition"] != partition:
+            raise ValueError(f"{path} uses a different evaluation partition")
+        if protocol is not None:
+            for key in ("intervals", "observation_delay_seconds"):
+                if archive.metadata.get(key) != protocol.metadata()[key]:
+                    raise ValueError(f"{path} uses a different temporal protocol: {key}")
+        if actual_hash is not None and archive.metadata.get("actual_sha256") != actual_hash:
+            raise ValueError(f"{path} uses a different actual cache")
         yield archive.metadata["model_name"], archive.get_forecast, archive.metadata["training_cutoff"]
 
 
@@ -159,7 +185,8 @@ def load_inputs(actual_path: Path, protocol_path: Path) -> tuple:
 
 def write_evaluation(output_dir: Path, partition: str, rows: list[dict], metadata: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    groups = {"horizon_metrics": "by_horizon", "monthly_metrics": "by_month", "hour_metrics": "by_hour"}
+    groups = {"horizon_metrics": "by_horizon", "horizon_band_metrics": "by_horizon_band",
+              "monthly_metrics": "by_month", "hour_metrics": "by_hour"}
     tables = {
         "metrics": [{key: value for key, value in row.items() if key not in groups.values()} for row in rows],
         **{name: [{"model": row["model"], "partition": partition, **group}
@@ -244,7 +271,8 @@ def main() -> int:
         actual, protocol, actual_hash = load_inputs(args.actual, args.protocol)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         rows = []
-        models = (archived_forecasters(args.snapshots, args.partition) if args.snapshots
+        models = (archived_forecasters(args.snapshots, args.partition, protocol=protocol,
+                                      actual_hash=actual_hash) if args.snapshots
                   else forecasters(actual, protocol, model_path))
         for name, get_forecast, cutoff in models:
             row = {"model": name, "training_cutoff": cutoff, **evaluate_forecast(

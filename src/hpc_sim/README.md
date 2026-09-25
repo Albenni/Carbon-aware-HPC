@@ -17,7 +17,9 @@ The simulator uses continuous timestamps rather than fixed ticks.
 
 All events at the same timestamp are processed before scheduling. Completions are applied before releases, so nodes released at `t` can be reused immediately at `t`.
 
-Ties are resolved by a monotonic sequence counter, making runs deterministic.
+Ties are resolved by a monotonic sequence counter, and jobs released at the same instant reach the scheduler in job-id order (the queue order), so runs are deterministic whatever the input order.
+
+The run ends at the last completion: a wakeup a policy left behind for a queue that has since emptied no longer stretches the makespan (before 2026-09-19 it did, by up to one decision bucket, which also lowered utilisation and throughput slightly for the receding and congestion policies; emissions and waiting were unaffected).
 
 Carbon-aware policies normally decide once at release and request a `TIMER` for the selected start rather than waking at every carbon bucket. A deferred job therefore adds one event, not one event per bucket.
 
@@ -78,9 +80,12 @@ Only the pivot is reserved, preventing starvation of the queue head.
 Its main options are:
 
 - `max_delay`: fixed voluntary delay budget;
-- `max_delay_fraction`: budget proportional to predicted runtime;
+- `max_delay_fraction`: budget proportional to predicted runtime, optionally capped by `max_delay_cap`;
 - `forecast=True`: use the latest issued forecast rather than future actuals;
-- `reach`: limit the budget to the horizon a forecast archive can safely cover.
+- `reach`: limit the budget to the horizon a forecast archive can safely cover;
+- `objective`, `delay_price_gco2e_per_hour`, `min_carbon_saving_per_delay`: how a candidate is scored (see [Delay-aware objectives](#delay-aware-objectives)); the defaults are the greedy carbon minimum.
+
+A window the forecast cannot cover is no longer an error: the job is offered to EASY at once and the decision is recorded with reason `forecast-unavailable`. Every forecast read is checked against its own decision instant, and `decision_records()` returns one row per decision that set or moved a target (instant, forecast issue, previous and new target, deadline, nominal and effective budget, predicted cost now and at the target, congestion penalty, best benefit rate, reason).
 
 Scheduler names encode the selected combination, including:
 
@@ -90,6 +95,39 @@ Scheduler names encode the selected combination, including:
 - `carbon-forecast-scaled-delay`
 
 with `-bounded` when applicable.
+
+### Receding-horizon carbon-aware EASY
+
+`RecedingHorizonCarbonAwareScheduler` re-runs the same greedy choice whenever the provider has reissued, over the part of the budget still ahead of the job.
+
+The deadline stays `release_time + max_delay` and is recomputed from the release instant on every revisit, so a revision can only spend budget the job already had. Candidates start at the current instant; ties still go to the earliest. With an immutable signal every revisit returns the previous answer, so an oracle run is identical to `CarbonAwareScheduler`.
+
+- `redecide_ready=False` restricts revisits to jobs still being held, leaving a job alone once its target has arrived;
+- `replan_on_events=True` also revisits when the queue gains a job, the running set changes or a running job overruns its estimate, in the oracle too; boundary wakeups stop once no queued job has budget left;
+- a `forecast=True` run requires a `reach`, and a revisit asks the forecast only for the budget left plus the predicted run.
+
+Names are the baseline's with a `receding-` prefix, e.g. `receding-carbon-aware-forecast-bounded`. `scripts/compare_baselines.py --receding-horizon` adds one such row per forecast archive. Results in `results/scheduler_results.md`.
+
+### Congestion-aware receding horizon with carbon-opportunity priority
+
+`CongestionAwareRecedingScheduler` is the receding policy plus two things, both computed only from what is known at the decision instant:
+
+- **congestion price** — node occupancy is projected over the budget from running jobs (until their estimated completion) and the standing targets of released jobs; a candidate start whose projected free nodes fall short of the request costs an extra `congestion_price x energy_kWh x min(1, overflow_nodes / nodes_required)` gCO2e;
+- **opportunity priority** — at every reissue the waiting jobs are retargeted in decreasing order of predicted opportunity (emissions starting now minus the cheapest candidate), each claiming its target before the next is scored, so scarce clean buckets go to the jobs with most to save.
+
+The deadline is still `release_time + max_delay`. `congestion_price=0` is exactly the receding policy; the default `1.0` is the development-selected value. Names carry a `congestion-` prefix; `scripts/compare_baselines.py --congestion-price 1` adds one row per forecast archive.
+
+Three options, off by default, extend the coordination: `congestion_scope="interval"` charges the overflow share averaged over the whole estimated run (on the decision grid) instead of at the start instant; `replan_on_events=True` with `planning_jobs=N` gives each new job a claim-free decision at release and then coordinates the first `N` deferrable jobs in queue order after every change, the rest standing as fixed claims; `overrun_to_horizon=True` makes a running job past its estimate hold its nodes to the end of the plan. It remains a penalised heuristic: claims may overlap, and EASY and the cluster guarantee real capacity. `benefit-rate` cannot be combined with a positive congestion price (a ratio and grams do not add).
+
+### Delay-aware objectives
+
+Every decision goes through `choose_start`. At decision instant `t`, a candidate `s` adds `D = (s - t)` hours of delay and saves `C(t) - C(s)` predicted gCO2e; `t` itself is always admissible and means "offer the job to EASY now".
+
+- `objective="carbon"` - the greedy minimum of `C(s)`.
+- `objective="carbon-delay"` - minimise `C(s) + delay_price_gco2e_per_hour x D`; with `min_carbon_saving_per_delay = theta > 0`, a deferral must also save carbon at more than `theta` gCO2e per job-hour. Price and threshold both zero is the greedy bit for bit.
+- `objective="benefit-rate"` - among deferrals saving more than `theta` gCO2e per job-hour, take the largest saving per hour, earliest on ties; with none, start now.
+
+Ties always go to the earliest start. The deadline stays `release_time + budget`, fixed at release. Because the price and threshold are absolute, predicted power now moves the decision, not only its cost. The 2026-09-19 round (`results/improved_scheduler_results.md`) selected `receding + benefit-rate, theta = 0.0149 gCO2e/job-h, fixed 6 h` on validation; on the test cohort it Pareto-dominates the congestion incumbent (realistic saving 0.548 % vs 0.432 %, mean wait 2,194 s vs 6,590 s). The operational default is unchanged.
 
 ### Carbon + power cap
 

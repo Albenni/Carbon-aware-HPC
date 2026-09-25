@@ -35,11 +35,10 @@ def _finite_float(value: object, field_name: str) -> float:
 class JobPowerProfile:
     """The power and duration data needed to account for one job.
 
-    This is intentionally not the simulator's future ``Job`` model. It is a
-    small accounting input that can later be embedded in, or constructed from,
+    This is a small accounting input that can be embedded in, or constructed from,
     a scheduler job.
 
-    ``average_power_watts`` and every measured sample represent whole-job
+    ``average_power_watts`` and every measured sample represent whole job
     power. For PM100, the node trace is already aggregated over all allocated
     nodes and both sockets.
     """

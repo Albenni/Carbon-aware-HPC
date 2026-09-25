@@ -112,6 +112,64 @@ Offline reproduction:
 .venv/bin/python scripts/prepare_carbon_history.py --offline
 ```
 
+## Exogenous grid signals
+
+`exogenous.py` downloads the IT-NO drivers of the carbon series for the training partition, `2016-01-01` to `2020-01-01` exclusive, and aligns them on the same 15-minute grid. No model reads them yet.
+
+```bash
+.venv/bin/python -m carbon_intensity.exogenous            # fetch what is missing, rebuild
+.venv/bin/python -m carbon_intensity.exogenous --offline  # rebuild from the raw cache
+```
+
+| Signal          | v4 endpoint                   | Columns                                                                            |
+| --------------- | ----------------------------- | ---------------------------------------------------------------------------------- |
+| Production mix  | `/electricity-mix/past-range` | `mix_<source>_mw`, hydro/battery storage charge and discharge, import/export totals |
+| Border flows    | `/electricity-flows/past-range` | `net_import_<zone>_mw` for AT, CH, FR, SI, IT-CNO                                  |
+| Total load      | `/total-load/past-range`      | `total_load_mw`, estimation flag, method, source                                   |
+| Net load        | `/net-load/past-range`        | `net_load_mw`, estimation flag, method, source                                     |
+| Day-ahead price | `/price-day-ahead/past-range` | `price_day_ahead_eur_per_mwh`                                                      |
+
+The API accepts at most three days per 15-minute request: 487 requests per signal. Outputs, in the gitignored `data/carbon_intensity/exogenous/`:
+
+- `raw/<signal>/<start>_<end>.json`: every answer verbatim, including the 404 "no data" ones; reruns reuse them;
+- `signals.parquet`: 140,256 rows whose index is exactly the protocol's train grid;
+- `quality.json`: coverage, gaps, duplicates, native resolution, nulls and flags per year, and cross-checks.
+
+Conventions:
+
+- **Border flows.** The API files a neighbour under `import` or `export` by the sign of the flow on the alphabetically ordered pair (`AT->IT-NO`, `IT-NO->SI`), not from IT-NO's side. `net_import_<zone>_mw` is signed from IT-NO's side, positive when it imports. It reproduces the mix's import and export totals on every bucket; the literal reading matches 8 of 140,256.
+- **Nothing is filled.** Missing buckets stay missing and API nulls stay null. Hydro storage sets exactly one of charge and discharge per bucket, so the other null means "not in that direction".
+- **Estimates are blanked, flags kept.** A value counts as estimated if `isEstimated` is true, its method is not `MEASURED`, or its `source` names an estimation. The four estimated hours on 2019-01-24 09:00–09:45 UTC average the hours either side, so they use the next hour.
+- **Availability.** Mix, flows and load are hourly values repeated on the 15-minute grid, and net load is built from that load, so `measured_available_at` is the end of the bucket's hour. The protocol's observation delay is added on top. `price_available_at` is 14:00 Europe/Rome on the day before delivery: GME publishes by 12:55, and the extra hour covers delayed market coupling.
+- **Revised values.** `updatedAt` runs from 2025-10 to 2026-08. This is the same replay assumption as the actual series, not an as-published archive.
+
+| Signal     | Coverage | Missing                                        | Resolution | Estimated, blanked                              |
+| ---------- | -------: | ---------------------------------------------- | ---------- | ----------------------------------------------- |
+| Mix        |     100% | none                                           | hourly     | 4                                               |
+| Flows      |     100% | per border, below                              | hourly     | the API has no flags                            |
+| Total load |     100% | none                                           | hourly     | 4                                               |
+| Net load   |   31.99% | everything before `2018-09-20T14:00Z` (404)    | 15-minute  | 1,232, of which 1,228 are flagged only by `source` |
+| Price      |   99.86% | local days 2018-08-31 and 2019-09-12           | hourly     | the API has no flags                            |
+
+No duplicate or off-grid timestamps were returned. Borders enter the data at different times (UTC): CH and AT from 2016-01-01, FR from 2016-02-20, SI from 2016-02-22 23:00, IT-CNO only from 2017-12-31 23:00. Earlier import and export totals omit the missing borders.
+
+Structure a feature builder has to respect:
+
+- `total_load_mw` equals production + imports − exports − storage charge + discharge on every bucket. It is a balance of the other two datasets, not an independent measurement, and its level moves when a border joins the balance.
+- Coal is reported only from 2017-06-26 22:00 UTC. On 2018-12-21 most of `unknown` is reclassified as gas: it falls from about 5,800 to 2,300 MW within the day and stays near 2,000, while thermal output as a share of load barely moves. Only the sum gas + coal + oil + unknown is comparable across both breaks.
+- Net load is flow-traced and cannot be rebuilt from the zone's own wind and solar. 7.95% of buckets exceed total load, which points to an older vintage than the load.
+- Nuclear, geothermal and battery discharge are always null.
+
+Features that stay causal at issue time `t` with delay `d`:
+
+- any value of a bucket with `measured_available_at + d <= t`: lags, rolling statistics, shares of load, border net imports, thermal and renewable shares, net load from 2018-09-20 on;
+- the day-ahead price of every bucket with `price_available_at <= t`, *including future target buckets*: before 14:00 local that covers the rest of today, afterwards tomorrow as well;
+- calendar features, as today.
+
+```bash
+.venv/bin/python tests/check_carbon_intensity_exogenous.py
+```
+
 ## Temporal forecasting protocol
 
 `TemporalProtocol.from_workload(...)` reads only release and completion times from the cleaned PM100 workload.

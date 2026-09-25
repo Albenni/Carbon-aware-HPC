@@ -103,8 +103,15 @@ def build_scheduler(
         ),
         "runtime_estimate": estimate,
     }
+    options |= {
+        "objective": arguments.objective,
+        "delay_price_gco2e_per_hour": arguments.delay_price_gco2e_per_hour,
+        "min_carbon_saving_per_delay": arguments.min_carbon_saving_per_delay,
+    }
     if axes.get("scaled"):
         options["max_delay_fraction"] = arguments.max_delay_fraction
+        if arguments.max_delay_cap_hours is not None:
+            options["max_delay_cap"] = timedelta(hours=arguments.max_delay_cap_hours)
     else:
         options["max_delay"] = timedelta(hours=arguments.max_delay_hours)
     if axes.get("forecast"):
@@ -224,6 +231,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("weighted", "stored"),
         default="weighted",
         help="duration-weighted profile mean, or the stored arithmetic mean",
+    )
+    parser.add_argument(
+        "--objective",
+        choices=("carbon", "carbon-delay", "benefit-rate"),
+        default="carbon",
+        help="how a carbon-aware policy scores a candidate start (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--delay-price-gco2e-per-hour",
+        type=float,
+        default=0.0,
+        help="carbon-delay: gCO2e charged per job-hour of added delay",
+    )
+    parser.add_argument(
+        "--min-carbon-saving-per-delay",
+        type=float,
+        default=0.0,
+        help="gCO2e per job-hour a deferral must save to be admissible",
+    )
+    parser.add_argument(
+        "--max-delay-cap-hours",
+        type=float,
+        default=None,
+        help="cap on the duration-scaled budget, in hours",
     )
     parser.add_argument(
         "--output",

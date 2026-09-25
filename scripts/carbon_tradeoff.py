@@ -331,7 +331,7 @@ def main() -> int:
     print(f"workload                 {arguments.workload.name}")
     if contention_jobs:
         print(f"contention workload      {arguments.contention_workload.name}")
-        print(f"scheduled jobs           {len(jobs):,}")
+        print(f"scheduled jobs           {len(evaluation_jobs) + len(contention_jobs):,}")
         print(f"evaluation jobs          {reference.job_count:,} COMPLETED")
         print(f"contention-only jobs     {len(contention_jobs):,}")
         print("metric boundary          QoS/carbon: evaluation; nodes: all jobs")
@@ -391,7 +391,7 @@ def main() -> int:
     if contention_jobs:
         rows = [
             {
-                "scheduled_jobs": len(jobs),
+                "scheduled_jobs": len(evaluation_jobs) + len(contention_jobs),
                 "contention_only_jobs": len(contention_jobs),
                 **row,
             }
