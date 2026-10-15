@@ -13,4 +13,17 @@ docs/preEditoriale.pdf
 
 # Data files
 /data
-/results
+/results/*
+# !/results/qos_carbon/
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.dvi
+*.toc
+*.log
+*.out
+*.synctex.gz
+*.run.xml
+/misc
+/thesis

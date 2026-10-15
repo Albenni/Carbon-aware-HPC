@@ -2,8 +2,8 @@
 
 Every run scores the same workload on the same cluster, so the only thing
 changing along a row is how long the carbon-aware policy is allowed to hold a
-job back. That is the whole experiment: emissions fall monotonically with the
-budget, quality of service pays for it, and the table shows the exchange rate.
+job back. The table measures the exchange rate; neither realised emissions
+nor QoS is necessarily monotone under contention and imperfect information.
 
 EASY at the same runtime information is the reference point, and a zero budget
 reproduces it, so the first row doubles as a check that the sweep starts from

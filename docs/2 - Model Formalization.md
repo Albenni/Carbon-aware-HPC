@@ -1,42 +1,3 @@
-## 2. Formalizzazione del modello di carbon footprint
-
-Definire un modello sufficientemente semplice ma utile per lo scheduling e la simulazione.
-
-### Possibili modelli iniziali
-
-- Modello a **potenza media costante**
-- Modello a **energia totale + carbon intensity media**
-- Eventuali semplificazioni progressive da raffinarsi in seguito
-
-### Questioni aperte
-
-- Come gestire i **job multi-nodo**?
-  - Somma sui nodi?
-  - Somma su partizioni?
-- Consideriamo differenze di **efficienza hardware** tra nodi/partizioni?
-- È davvero necessario prevedere direttamente la CO₂ come target ML?
-  - Probabilmente **no**
-  - Più plausibile combinare predizioni di:
-    - energia,
-    - potenza,
-    - tempo/durata
-
-### Domande guida
-
-- La **carbon intensity** va presa:
-  - come dato storico reale,
-  - come forecast,
-  - come serie sintetica?
-- Quale **granularità temporale** usare?
-  - 5 minuti
-  - 15 minuti
-  - 1 ora
-- Il simulatore opererà in **tempo continuo** o **tempo discreto**?
-- Consideriamo solo **operational carbon** oppure anche **embodied carbon**?
-  - Suggerimento: considerare **solo operational carbon**
-
----
-
 ## 2. Formalization of the Carbon Footprint Model
 
 ### 2.1 Objective and Model Boundaries
@@ -61,13 +22,13 @@ Under the provider contract, $CI(t)$ is expressed in `gCO2e/kWh` and $C_j$ in
 `emissions_gco2`, but represents grams of CO₂-equivalent when this provider is
 used.
 
-At present, carbon accounting, the two power models, an actual-only
-carbon-intensity provider backed by a real Electricity Maps `IT-NO` series, the
-discrete-event simulator, and the reference baselines — FCFS, EASY
-backfilling, and a power-capped energy-aware policy — are implemented, together
-with the evaluation metrics used to compare them. Forecast retrieval, the
-carbon-aware policies, and the ML models described in the following sections
-have not yet been implemented.
+Carbon accounting, historical CI and issued forecast archives, the discrete-event
+simulator, FCFS/EASY/power-capped baselines, greedy and receding carbon policies,
+congestion pricing, delay objectives, job predictors and the small-instance
+MILP are implemented. The [main evaluation](../results/qos_carbon/README.md)
+and [robustness report](../results/qos_carbon/robustness/README.md) contain the
+current results, protocols and reproducible commands. Robustness experiments
+validate existing mechanisms without changing the scheduling algorithms.
 
 ### 2.2 Notation
 
@@ -158,7 +119,7 @@ C_j^{\mathrm{avg}}(s_j) =
 \sum_k CI_k\,\ell_{j,k}(s_j).
 $$
 
-This is the reference model for the future scheduler because it requires
+This is the implemented scheduling model because it requires
 only duration, average power, and the carbon-intensity time series, while keeping
 the start time as a variable. The overlap-based formula is exact.
 
@@ -194,10 +155,10 @@ realistic scheduler.
 | Multi-node jobs      | In general, the power of the nodes actually allocated to the job is summed. In [PM100](https://dl.acm.org/doi/10.1145/3624062.3624263), this sum, including both power sockets, is already contained in `node_power_consumption`: the profile must therefore be used directly, without multiplying it by `num_nodes_alloc` and without adding CPU or memory profiles. Partitions are not summed.                                                           |
 | Hardware differences | The first analysis uses only anonymized partition `1` and assumes a single execution class. The measured profiles incorporate the differences actually observed, but no node- or partition-specific coefficient is introduced yet. Explicit heterogeneity remains an extension.                                                                                                                                                                            |
 | ML target            | CO₂ is not predicted directly. Instead, $\hat d_j$ and $\hat{\bar P}_j$ are predicted, or $\hat E_j$ together with duration, using only features known at submission time. These quantities are then combined with the external carbon-intensity signal.                                                                                                                                                                                                   |
-| Carbon intensity     | Actual historical and synthetic series are supported. Actual values and forecasts have separate access paths, and forecast retrieval remains part of later work. The `IT-NO` actual series is cached and covers 2020-04-30 to 2020-11-01, spanning the whole workload with 19 days of headroom for delayed schedules; it is used for accounting, ex-post evaluation, and the perfect-information benchmark, while synthetic values serve controlled tests. |
-| Cluster capacity     | 880 nodes, the distinct node ids observed in partition `1` across the raw `COMPLETED` trace (ids 20-979). Observed peak concurrency is lower (787 raw, 774 after cleaning) and is a lower bound on the machine rather than its capacity. The value is configurable and is a candidate for sensitivity analysis.                                                                                                                                            |
-| Granularity          | Initial choice: piecewise-constant carbon intensity at 15-minute resolution, explicitly requested from Electricity Maps. PM100 profiles remain at 20-second resolution; 5- and 60-minute resolutions will be used for sensitivity analysis.                                                                                                                                                                                                                |
-| Temporal model       | A discrete-event simulator with continuous timestamps is planned. Submission/eligibility, completion, and changes in carbon intensity are events; a fixed tick is not required.                                                                                                                                                                                                                                                                            |
+| Carbon intensity     | Actual historical and synthetic series and issued forecast archives are supported. Actual values and forecasts have separate access paths; decisions use only snapshots issued by the decision time. The `IT-NO` actual series is cached and covers 2020-04-30 to 2020-11-01, spanning the whole workload with 19 days of headroom for delayed schedules; it is used for accounting, ex-post evaluation, and the perfect-information benchmark, while synthetic values serve controlled tests. |
+| Cluster capacity     | 880 nodes, the distinct node ids observed in partition `1` across the raw `COMPLETED` trace (ids 20-979). Observed peak concurrency is lower (787 raw, 774 after cleaning) and is a lower bound on the machine rather than its capacity. The complete test cohort is compared at 880/512/256 nodes; these are capacity stress tests, not measurements of instantaneous historical availability.                                                                                                                                            |
+| Granularity          | Piecewise-constant CI at 15-minute resolution. PM100 power segments remain nominally 20 seconds. Decision grids of 15/60/240 minutes are compared without changing the CI resolution.                                                                                                                                                                                                                |
+| Temporal model       | Implemented discrete-event simulator with continuous timestamps: release, completion and scheduler-requested wakeups; no fixed simulation tick.                                                                                                                                                                                                                                                                            |
 | Emissions boundary   | Only operational carbon assigned to the input power profile of the nodes is considered. Embodied carbon and overhead external to the profile are excluded.                                                                                                                                                                                                                                                                                                 |
 
 For direct historical replay, the time series must refer to the electricity grid zone and
@@ -227,34 +188,36 @@ download succeeds.
 The decision variable is $s_j$, and the schedule cost is
 $\sum_j C_j(s_j)$. In the first simulator, jobs are non-preemptive and the nodes in the
 partition are treated as equivalent, so capacity is tracked as a node count and
-the `nodes` identifier list remains validation-only. A start time is feasible only if
-the job is eligible, enough nodes are available, and any maximum delay constraint is
-satisfied.
+the `nodes` identifier list remains validation-only. Execution requires eligibility
+and sufficient free nodes. A carbon target is bounded by the voluntary delay
+budget; actual waiting may exceed it because resources remain occupied.
 
 The implementation lives in `src/hpc_sim/`. It uses continuous timestamps with
-no fixed tick; releases, completions, and carbon-intensity bucket boundaries are
-events, and the last of these is delivered only to a policy that registers
-interest, so a carbon-blind baseline never observes one. Actual duration always
+no fixed tick; releases, completions and scheduler-requested timers are events.
+Carbon-aware policies request wakeups at targets and decision-grid boundaries;
+carbon-blind baselines do not request carbon wakeups. Actual duration always
 governs when nodes are released, while a policy reads
 `Job.scheduling_duration_seconds`, which returns a prediction when one exists —
 this is the single seam that keeps §2.7's separation of decision information
-from simulated execution honest once a latest predictions arrive. Emissions are
+from simulated execution explicit. Emissions are
 computed after the event loop rather than inside it, so the engine is
 signal-agnostic and a forecast provider substitutes for an actual one without
-any change to the simulator. Initially, this delay is proposed to be measured from `eligible_time`;
-this convention will need to be compared with submission time and the baseline.
+any change to the simulator. The final experiments measure waiting and voluntary budgets from
+`eligible_time`/release and compare each job with its matched EASY execution.
+Submission-based metrics remain available separately in the simulator.
 
 The reference baselines are FCFS, EASY backfilling, and a power-capped variant
 of EASY. EASY grants the blocked head of the queue a reservation — the earliest
 instant at which the jobs holding its resources are projected to release them —
 and lets later jobs overtake it only when they provably cannot push that
-reservation back. This is the property that prevents starvation, and it is
-what the validation checks rather than any particular backfilling outcome.
+reservation back. The checks validate this reservation protection under the specified runtime
+estimates. Forecast errors and carbon deferrals mean it is not an unconditional
+starvation guarantee for the complete carbon-aware system.
 
 Which runtime estimate the reservation is built on is an information choice, not
 an implementation detail, so it is explicit. Classic EASY uses the walltime the
 user requested; the alternative reads the same prediction seam the carbon-aware
-policies will use, which is what makes "the same information for every
+policies use, which is what makes "the same information for every
 scheduler compared" verifiable rather than assumed. In PM100 the two differ
 sharply: the median job runs for 2.5% of its requested walltime, so classic
 reservations sit far in the future and suppress backfills that perfect
@@ -273,7 +236,7 @@ power it is waiting for.
 
 The carbon-aware policy implemented on top of these baselines is greedy and
 deliberately simple. When a job becomes eligible it scores every candidate start
-time within its delay budget — the release instant, then the carbon-intensity
+time within its delay budget — the release instant, then the decision
 grid up to `release + max_delay` — using the constant-average-power model of
 §2.4, and holds the job until the cheapest one. A held job is withheld from the
 placement pass rather than refused a slot, so it never occupies the head of the
@@ -282,8 +245,13 @@ when its target arrives. The budget therefore bounds the delay the carbon
 decision is responsible for, while contention can still add its own; a zero
 budget reproduces EASY exactly, which is what anchors the sweep.
 
-Because the schedule cannot change the signal and the signal cannot change the
-job, the choice is fixed at release. With actual future intensity this is the
+The greedy commits at release. The implemented receding policy revisits waiting
+jobs when newer forecast snapshots become available, preserving the original
+deadline. The selected improved policy maximises predicted carbon saving per
+hour of additional voluntary waiting, subject to a validation-selected threshold
+θ=0.014930658589279368 gCO₂e/job-hour. Duration scaling, congestion pricing and
+event-triggered replanning are implemented options, but are not all active in
+that selected configuration. With actual future intensity this is the
 perfect-information benchmark of §2.7, and it is a benchmark rather than a
 bound: the policy optimises each job independently and ignores the contention
 its own decisions create, so every job aims at the same clean interval and the
@@ -311,7 +279,7 @@ are historical ground truth reused at the new simulated start time.
 
 | Configuration                 | Information Available at Decision Time                                | Purpose                                                  |
 | ----------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------- |
-| Perfect information benchmark | actual duration, actual PM100 profile, actual future carbon intensity | Measures the potential without prediction errors         |
+| Perfect information benchmark | actual duration, duration-weighted mean power, actual future carbon intensity | Measures the potential without prediction errors         |
 | Forecast only error           | actual job data, carbon-intensity forecast                            | Isolates the effect of electricity-signal forecast error |
 | Job model only error          | predicted duration and power, actual future carbon intensity          | Isolates the effect of job predictions                   |
 | Realistic scenario            | predicted duration and power, forecast available at decision time     | Evaluates the system that can actually be used online    |
@@ -351,9 +319,23 @@ required to achieve those savings?**
 - The first version does not consider preemption, geographic migration, or embodied
   carbon.
 
-These simplifications keep the model verifiable and sufficient to
-build the first simulator. Extensions should be introduced only after
-measuring the benefit of the benchmark and the carbon–QoS trade-off.
+The final robustness protocol reports p95, p99 and maxima, paired extra waiting,
+and fixed short/long (<1 h/≥1 h) and small/large (≤8/>8 nodes) classes. Four
+adjacent release windows cover the retrospective test cohort; cold-start runs
+are compared with groups extracted from full-trace schedules. Their observed
+min/median/max describe temporal variability, not independent confidence
+intervals or seasonal generalisation. Capacity and grid sensitivity retain the
+same job ids. All real executions are drained, including completions after the
+release-window boundary. The 23 h forecast reach further limits each job's
+voluntary budget by its planning runtime. Missing usable forecasts are counted
+and fall back to immediate eligibility for EASY.
+
+Threats to validity include historical filtering, missing initial backlog,
+partial terminal demand, reused test periods, correlated windows and forecasts,
+uncertain instantaneous cluster availability, and the assumption that shifting
+preserves the measured power profile. Savings are modelled operational emissions,
+not a causal estimate of marginal grid emissions avoided. The complete
+assumptions and measured sensitivity results are in the robustness report.
 
 ### 2.9 Essential References
 

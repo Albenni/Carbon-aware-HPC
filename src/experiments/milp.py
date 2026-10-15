@@ -45,6 +45,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timedelta
+from math import fsum
 from pathlib import Path
 import sys
 from time import perf_counter
@@ -86,6 +87,15 @@ TIE_BREAK = 1e-3
 MIP_GAP = 1e-6
 
 
+def planning_emissions(jobs, starts, signal: CarbonSignal) -> float:
+    """Score the exact MILP coefficients, including CI bucket boundaries.
+
+    Ex-post average-power accounting samples CI every power-profile interval;
+    it is close to this integral but is not the objective a solver bounds.
+    """
+    return fsum(carbon_cost_gco2e(job, starts[job.job_id], signal) for job in jobs)
+
+
 def solve(
     jobs: tuple[Job, ...],
     signal: CarbonSignal,
@@ -96,31 +106,41 @@ def solve(
     references: Iterable[SimulationResult] = (),
     delay_weight: float = TIE_BREAK,
     time_limit: float = 600.0,
+    reach: timedelta | None = None,
 ) -> tuple[dict[object, datetime], dict[str, object]]:
     """Every job's start in the cheapest schedule, and how the solver got there.
 
     ``solution_status`` separates a plan proven optimal within the gap, a
-    feasible plan found before the time limit (not a proof of anything), and
+    feasible plan found before the time limit (not a proof of optimality), and
     no plan at all, in which case the returned mapping is empty.
+
+    ``reach`` applies the online policy's effective budget, capped at
+    ``max(0, reach - scheduling_duration)``. Reference starts remain in the
+    domain even when capacity pushed them past that voluntary budget.
     """
 
+    if max_delay < timedelta(0) or granularity <= timedelta(0):
+        raise ValueError("max_delay must be nonnegative and granularity positive")
+    budgets = [max_delay if reach is None else min(
+        max_delay, max(timedelta(0), reach - seconds(job.scheduling_duration_seconds))
+    ) for job in jobs]
     extra: dict[object, set[datetime]] = defaultdict(set)
     for result in references:
         for record in result.records:
             extra[record.job_id].add(record.start_time)
     candidates = [
         sorted(
-            set(candidate_start_times(job, max_delay=max_delay, granularity=granularity))
+            set(candidate_start_times(job, max_delay=budget, granularity=granularity))
             | extra[job.job_id]
         )
-        for job in jobs
+        for job, budget in zip(jobs, budgets)
     ]
     times = sorted({start for starts in candidates for start in starts})
     # The domain holds every reference start, including ones contention pushed
     # past the voluntary budget; count them so the domain is stated, not implied.
     beyond_budget = sum(
-        start > job.release_time + max_delay
-        for job, starts in zip(jobs, candidates)
+        start > job.release_time + budget
+        for job, starts, budget in zip(jobs, candidates, budgets)
         for start in starts
     )
 
@@ -242,7 +262,10 @@ def compare(
     measured = {name: scored.total_emissions_gco2e for name, scored in metrics.items()}
     # Optimality is proven on the average-power model the program minimises, so
     # the optimality figures are taken there; measured emissions stay alongside.
-    model = {name: scored.total_emissions_gco2e_average_model for name, scored in metrics.items()}
+    signal = CarbonSignal(provider)
+    model = {name: planning_emissions(
+        jobs, {record.job_id: record.start_time for record in result.records}, signal
+    ) for name, result in runs.items()}
     available = model["easy"] - model["milp_optimum"]
     budget = max_delay.total_seconds()
 

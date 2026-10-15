@@ -40,7 +40,7 @@ CARBON_END ?= 2020-11-02T00:00:00Z
         job-search job-train job-train-ridge job-scheduling-impact job-compare \
         simulate simulate-all simulate-predicted simulate-forecast baselines baselines-full \
         tradeoff tradeoff-predicted tradeoff-contention \
-        ablation milp improved-scheduler \
+        ablation milp improved-scheduler qos-carbon qos-carbon-report robustness robustness-report \
         clean clean-pycache clean-venv
 
 help: ## Mostra i target disponibili
@@ -77,6 +77,14 @@ install: $(INSTALL_STAMP) ## Installa il progetto in editable mode nella .venv
 reinstall: ## Forza la reinstallazione editable
 	@rm -f $(INSTALL_STAMP)
 	$(MAKE) install
+
+.PHONY: thesis
+
+thesis:
+	cd thesis && lualatex main.tex
+	cd thesis && $(HOME)/bin/biber main
+	cd thesis && lualatex main.tex
+	cd thesis && lualatex main.tex
 
 # -----------------------------------------------------------------------------
 # Test
@@ -230,6 +238,18 @@ milp: install ## Esegue il benchmark MILP su istanze ridotte/configurabili
 PHASE ?= smoke
 improved-scheduler: install ## Scheduler delay-aware: PHASE=prepare|smoke|validation|test|milp|report
 	$(VENV_PYTHON) -m experiments.improved_scheduler $(PHASE) $(ARGS)
+
+qos-carbon: install ## Consolida QoS/carbon: cache, quattro scenari, controlli errori, MILP, CSV e figure
+	$(VENV_PYTHON) -m experiments.qos_carbon run $(ARGS)
+
+qos-carbon-report: install ## Rigenera report e figure QoS/carbon dai soli CSV salvati
+	$(VENV_PYTHON) -m experiments.qos_carbon report $(ARGS)
+
+robustness: install ## Completa sensitivity, ablation, fairness e output per la tesi
+	$(VENV_PYTHON) -m experiments.robustness run $(ARGS)
+
+robustness-report: install ## Rigenera figure e tabelle di robustezza dai soli CSV
+	$(VENV_PYTHON) -m experiments.robustness report $(ARGS)
 
 # -----------------------------------------------------------------------------
 # Cleanup (intentionally preserves datasets and experiment results)

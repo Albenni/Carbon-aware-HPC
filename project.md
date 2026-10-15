@@ -1,208 +1,52 @@
 # Tesi — Carbon-aware scheduling per sistemi HPC
 
-## Obiettivo generale
+Il sistema è implementato; il lavoro corrente è la validazione sperimentale e
+la preparazione della tesi. Risultati e comandi aggiornati sono in [REPORT.md](REPORT.md).
 
-Progettare, implementare e valutare strategie di scheduling per sistemi HPC che minimizzino o bilancino i seguenti aspetti:
+## Sistema realizzato
 
-1. **Carbon footprint**
-2. **Consumo energetico**
-3. **Prestazioni di sistema**
-4. **Qualità del servizio per gli utenti**
+- Carbon accounting con potenza media per il planning e profili PM100 misurati
+  per le emissioni ex post; durata e potenza del job restano invarianti allo start.
+- Carbon intensity storica IT-NO, forecasting e archivio degli snapshot emessi:
+  ogni decisione realistica legge solo informazioni già disponibili.
+- Simulatore a eventi con timestamp continui, cluster omogeneo espresso in nodi,
+  job non preemptive, baseline FCFS/EASY e power cap.
+- Scheduler greedy, receding horizon, congestion awareness, obiettivi con prezzo
+  del ritardo e benefit-rate, budget fisso o proporzionale alla durata.
+- Predittori di runtime/potenza e controlli che separano gli errori dei job dal
+  forecast; MILP offline su piccole istanze con dominio e gap espliciti.
 
-> Nota: anche concentrarsi inizialmente **solo sulla dimensione (1) carbon footprint** potrebbe essere già sufficiente e più gestibile.
+L'improved selezionato sulla validation usa receding horizon, benefit-rate e
+soglia congelata. La verifica finale non aggiunge meccanismi allo scheduler.
 
-## Strumenti e approccio metodologico
+## Output per la tesi
 
-La tesi sfrutterà tre componenti principali:
+Il [confronto principale](results/qos_carbon/README.md) misura EASY, greedy e
+improved sui budget 0/1/3/6/12/24 h e sulle quattro combinazioni di informazione.
+Il [report di robustezza](results/qos_carbon/robustness/README.md) aggiunge quattro
+finestre temporali, 880/512/256 nodi, griglie 15/60/240 minuti, domanda terminale,
+cinque contrasti di ablation, fairness/tail QoS e classi short/long × small/large.
+Fornisce figure PNG/PDF e una tabella rappresentativa CSV/Markdown/LaTeX.
 
-- **Predizioni ML**
-  - Possibile ispirarsi a modelli già esistenti in letteratura
-- **Ottimizzazione matematica**
-  - In particolare, possibile uso di **Constraint Programming (CP)**
-- **Simulazione**
-  - Valutazione su **trace reali di un sistema HPC**
+```bash
+make qos-carbon ARGS='--workers 2'
+make robustness ARGS='--workers 2'
+make robustness-report
+```
 
----
+[Formalizzazione](docs/2%20-%20Model%20Formalization.md),
+[dataset e filtering](docs/PM100_features.md),
+[esperimenti e riproduzione](src/experiments/README.md).
 
-# Fasi operative
+## Ambito delle conclusioni
 
-## 1. Revisione della letteratura mirata
+Si stimano emissioni operative attribuite ai profili dei nodi, non l'impronta
+completa del datacenter o emissioni marginali evitate. Il test è retrospettivo,
+le finestre sono adiacenti e il workload filtrato non ricostruisce tutta la
+domanda storica. Capacità ridotte e domanda terminale sono controlli distinti;
+il budget carbonico non garantisce un limite all'attesa da contesa. Le code e
+le differenze per classe vanno discusse insieme alle medie.
 
-Effettuare una ricognizione iniziale della letteratura, senza necessariamente leggere in dettaglio tutti gli articoli, ma per costruire un quadro chiaro del contesto e preparare la futura sezione di related work della tesi.
-
-### Temi da esplorare
-
-#### HPC job scheduling
-
-- **FCFS**
-- **EASY Backfilling**
-- **Priority-based scheduling**
-
-#### Power-aware / Energy-aware scheduling
-
-- Obiettivi tipici
-- Metriche tipiche
-- Trade-off tra energia e prestazioni
-
-#### Carbon-aware computing
-
-- Differenza tra **energy-aware** e **carbon-aware**
-- Uso dei segnali di **carbon intensity** della rete elettrica
-- Impatto del momento di esecuzione dei job sulle emissioni
-
-#### Optimization-based scheduling in HPC
-
-- **MILP**
-- **Constraint Programming (CP)**
-
-### Domande guida per la letteratura
-
-- La **carbon footprint** dipende solo dall’energia consumata oppure anche dal **momento temporale** in cui il job viene eseguito?
-- Serve una **predizione diretta della CO₂ per job**, oppure basta combinare:
-  - potenza/energia prevista,
-  - durata prevista,
-  - carbon intensity del sistema elettrico nel tempo?
-- La differenza tra **scheduling carbon-aware** e **energy-aware** è probabilmente cruciale e potrebbe diventare un cardine della tesi.
-
-## 2. Formalizzazione del modello di carbon footprint
-
-Definire un modello sufficientemente semplice ma utile per lo scheduling e la simulazione.
-
-### Possibili modelli iniziali
-
-- Modello a **potenza media costante**
-- Modello a **energia totale + carbon intensity media**
-- Eventuali semplificazioni progressive da raffinarsi in seguito
-
-### Questioni aperte
-
-- Come gestire i **job multi-nodo**?
-  - Somma sui nodi?
-  - Somma su partizioni?
-- Consideriamo differenze di **efficienza hardware** tra nodi/partizioni?
-- È davvero necessario prevedere direttamente la CO₂ come target ML?
-  - Probabilmente **no**
-  - Più plausibile combinare predizioni di:
-    - energia,
-    - potenza,
-    - tempo/durata
-
-### Domande guida
-
-- La **carbon intensity** va presa:
-  - come dato storico reale,
-  - come forecast,
-  - come serie sintetica?
-- Quale **granularità temporale** usare?
-  - 5 minuti
-  - 15 minuti
-  - 1 ora
-- Il simulatore opererà in **tempo continuo** o **tempo discreto**?
-- Consideriamo solo **operational carbon** oppure anche **embodied carbon**?
-  - Suggerimento: considerare **solo operational carbon**
-
-## 3. Modellazione della carbon intensity nel simulatore
-
-Studiare come rappresentare nel simulatore il consumo di CO₂ e i segnali esterni di carbon intensity.
-
-### Opzioni possibili
-
-1. **Tracce storiche reali** di carbon intensity
-2. **Serie temporali pubbliche** e dati reali di grid intensity
-3. **Profili sintetici**, nel caso in cui i dati reali non siano disponibili
-
-### Componente da introdurre nel simulatore
-
-- `CarbonIntensityProvider`
-  - Input: timestamp
-  - Output: carbon intensity corrispondente
-
-## 4. Integrazione dei modelli di consumo nel simulatore
-
-Integrare nel simulatore i modelli necessari alla valutazione delle strategie di scheduling.
-
-### Componenti da definire
-
-- Modello di **potenza media** oppure di **energia**
-- Modello di **durata** del job
-- Eventuale modello per predire la **carbon intensity** (se non disponibile come serie esterna)
-
-### Vincolo importante
-
-- Usare solo le **feature note al submission time**
-
-## 5. Baseline scheduler da implementare
-
-Definire e implementare alcuni scheduler di riferimento.
-
-### Possibili baseline
-
-- **FCFS**
-- **EASY backfilling**
-- **Power-aware / Energy-aware greedy scheduler**
-
-## 6. Metriche di valutazione
-
-### Metriche carbon / energia
-
-- **CO₂ totale emessa**
-- **CO₂ media per job**
-- **Energia totale consumata**
-- **Picchi di potenza** o di energia nel tempo
-
-### Metriche prestazionali HPC
-
-- **Average waiting time**
-- **Average turnaround time**
-- **Bounded slowdown**
-
-## 7. Progettazione delle strategie carbon-aware
-
-Fase successiva, da sviluppare dopo aver definito:
-
-- modello,
-- simulatori,
-- baseline,
-- metriche.
-
-Questa parte costituirà probabilmente il cuore sperimentale della tesi.
-
-# Ipotesi di lavoro iniziali
-
-## Ipotesi principali
-
-- La differenza tra **energy-aware** e **carbon-aware scheduling** è centrale.
-- Non è necessario prevedere direttamente la CO₂ per job.
-- È probabilmente sufficiente combinare:
-  - energia/potenza prevista,
-  - durata prevista,
-  - carbon intensity nel tempo.
-- Conviene limitarsi inizialmente a **operational carbon**.
-- Un modello semplificato può essere adeguato nella fase iniziale.
-
-# Questioni aperte da risolvere progressivamente
-
-- Come modellare in modo semplice ma realistico la carbon footprint?
-- Quale sorgente usare per la carbon intensity?
-- Quale granularità temporale adottare?
-- Come gestire job multi-nodo e differenze hardware?
-- Come integrare tutto nel simulatore senza introdurre complessità eccessiva?
-- Quali trade-off emergeranno tra:
-  - emissioni,
-  - consumo energetico,
-  - prestazioni,
-  - QoS?
-
----
-
-# Prossimi passi concreti
-
-1. Fare una **scansione iniziale della letteratura**
-2. Chiarire la distinzione tra:
-   - **energy-aware scheduling**
-   - **carbon-aware scheduling**
-3. Scegliere un primo **modello semplificato di carbon footprint**
-4. Definire come rappresentare la **carbon intensity** nel simulatore
-5. Implementare le **baseline**
-6. Definire le **metriche**
-7. Passare poi alla progettazione delle strategie **carbon-aware**
+Rimangono la redazione dei capitoli e la revisione della letteratura.
+Validazione stagionale/su altri siti, backlog iniziale completo e rolling-horizon
+MILP sono future work, non componenti mancanti del sistema valutato.

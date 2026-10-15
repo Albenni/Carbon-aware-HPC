@@ -206,6 +206,19 @@ class Scenario:
     max_nodes: int | None = None
     contention: bool = False
     nodes: int = NODES
+    window_start: str | None = None
+    window_end: str | None = None
+    grid_minutes: int = 15
+
+    def __post_init__(self) -> None:
+        if self.grid_minutes <= 0:
+            raise ValueError("decision grid must be positive")
+        if (self.window_start is None) != (self.window_end is None):
+            raise ValueError("a release window needs both bounds")
+        if self.window_start is not None:
+            start, end = (datetime.fromisoformat(value) for value in (self.window_start, self.window_end))
+            if start.tzinfo is None or end.tzinfo is None or start >= end:
+                raise ValueError("release windows must be ordered and timezone-aware")
 
     @property
     def id(self) -> str:
@@ -214,6 +227,10 @@ class Scenario:
             name += f"-first{self.subset}" + (f"-le{self.max_nodes}" if self.max_nodes else "")
         if self.contention:
             name += "-resource-only"
+        if self.window_start is not None:
+            name += f"-[{self.window_start},{self.window_end})"
+        if self.grid_minutes != 15:
+            name += f"-grid{self.grid_minutes}min"
         return f"{name}@{self.nodes}"
 
 
@@ -306,6 +323,11 @@ def subset_ids(scenario: Scenario) -> tuple[list[object], int]:
 
     kept, skipped = [], 0
     for job in cohort(scenario.stage)[0]:
+        if scenario.window_start is not None and not (
+            datetime.fromisoformat(scenario.window_start) <= job.release_time
+            < datetime.fromisoformat(scenario.window_end)
+        ):
+            continue
         if scenario.max_nodes is not None and job.nodes_required > scenario.max_nodes:
             skipped += 1
             continue
@@ -346,7 +368,8 @@ def resource_only(stage: str, information: str, jobs: tuple[Job, ...]) -> tuple[
             window_end=max(job.release_time for job in jobs) + timedelta(microseconds=1),
         )
 
-    extra = _cached(("contention", stage, len(jobs)), build)
+    extra = _cached(("contention", stage, min(job.release_time for job in jobs),
+                     max(job.release_time for job in jobs)), build)
     if information == "predicted":
         fallback = manifest()["max_train_time_limit_s"]
         extra = tuple(
@@ -360,17 +383,34 @@ def scenario_jobs(scenario: Scenario, information: str) -> tuple[tuple[Job, ...]
     """Evaluated jobs, resource-only jobs, and jobs the subset filter skipped."""
 
     actual, predicted = cohort(scenario.stage)
-    jobs = predicted if information == "predicted" else actual
+    if information == "actual":
+        jobs = actual
+    elif information == "predicted":
+        jobs = predicted
+    elif information in ("runtime-only", "power-only"):
+        # Counterfactual controls: execution is still measured; only the
+        # information supplied to the scheduler changes.
+        jobs = tuple(replace(
+            job,
+            predicted_duration_seconds=(job.predicted_duration_seconds
+                                        if information == "runtime-only" else job.actual_duration_seconds),
+            predicted_average_power_watts=(job.predicted_average_power_watts
+                                           if information == "power-only" else job.power.average_power_watts),
+        ) for job in predicted)
+    else:
+        raise ValueError(f"unknown job information: {information}")
     skipped = 0
-    if scenario.subset:
+    if scenario.subset or scenario.window_start is not None or scenario.max_nodes is not None:
         ids, skipped = subset_ids(scenario)
         keep = set(ids)
         jobs = tuple(job for job in jobs if job.job_id in keep)
+    if not jobs:
+        raise ValueError("the scenario contains no evaluated jobs")
     extra = resource_only(scenario.stage, information, jobs) if scenario.contention else ()
     return jobs, extra, skipped
 
 
-def build_scheduler(policy: Policy, carbon_information: str):
+def build_scheduler(policy: Policy, carbon_information: str, granularity: timedelta = GRANULARITY):
     actual, forecast, reach = carbon()
     estimate = RuntimeEstimateSource.SCHEDULING
     if policy.mode == "fcfs":
@@ -380,7 +420,7 @@ def build_scheduler(policy: Policy, carbon_information: str):
     realistic = carbon_information == "forecast"
     options = dict(
         runtime_estimate=estimate,
-        decision_granularity=GRANULARITY,
+        decision_granularity=granularity,
         reach=reach,
         forecast=realistic,
         objective=policy.objective,
@@ -424,13 +464,20 @@ def input_hashes() -> dict[str, str]:
 
 def run_directory(item: Task) -> tuple[str, Path]:
     scenario, information, carbon_information, policy = item
+    configuration = asdict(scenario)
+    # Preserve historical keys for the unchanged 15-minute, full-cohort runs.
+    for name, default in (("window_start", None), ("window_end", None), ("grid_minutes", 15)):
+        if configuration[name] == default:
+            del configuration[name]
     identity = {
-        "scenario": asdict(scenario),
+        "scenario": configuration,
         "job_information": information,
         "carbon_information": carbon_information,
         "policy": asdict(policy),
         "inputs": input_hashes(),
     }
+    if scenario.window_start is not None or scenario.grid_minutes != 15:
+        identity["experiment_source"] = sha256(Path(__file__))
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     return key, OUTPUT / "runs" / key
 
@@ -450,10 +497,10 @@ def execute(item: Task) -> dict:
 
     scenario, information, carbon_information, policy = item
     jobs, extra, skipped = scenario_jobs(scenario, information)
-    if information == "predicted":
+    if information != "actual":
         require_predictions(jobs + extra)
     actual, _, _ = carbon()
-    scheduler = build_scheduler(policy, carbon_information)
+    scheduler = build_scheduler(policy, carbon_information, timedelta(minutes=scenario.grid_minutes))
 
     started = perf_counter()
     result = Simulator(jobs + extra, Cluster(scenario.nodes), scheduler).run()
@@ -510,7 +557,9 @@ def execute(item: Task) -> dict:
             else "validation_predictions.parquet"
         ),
         "forecast_archive": INPUTS["archive"].stem if carbon_information == "forecast" else "",
-        "decision_granularity_minutes": GRANULARITY / timedelta(minutes=1),
+        "decision_granularity_minutes": scenario.grid_minutes,
+        "window_start": scenario.window_start,
+        "window_end": scenario.window_end,
         "evaluated_jobs": len(jobs),
         "resource_only_jobs": len(extra),
         **metrics.as_row(),
@@ -1130,7 +1179,7 @@ def decide(rows: pd.DataFrame, selection: dict) -> dict:
 def milp_instance(instance: dict) -> list[dict]:
     """One offline optimum on a capacity subset, against every policy run there."""
 
-    from experiments.milp import replay, solve
+    from experiments.milp import planning_emissions, replay, solve
 
     scenario = Scenario("test", subset=instance["jobs"], max_nodes=SUBSET_MAX_NODES, nodes=instance["nodes"])
     jobs, _, _ = scenario_jobs(scenario, "actual")
@@ -1148,8 +1197,9 @@ def milp_instance(instance: dict) -> list[dict]:
         ])
 
     weight = instance["delay_price"]
+    signal = CarbonSignal(actual)
     starts, solver = solve(
-        jobs, CarbonSignal(actual), nodes=instance["nodes"], max_delay=timedelta(hours=BUDGET_HOURS),
+        jobs, signal, nodes=instance["nodes"], max_delay=timedelta(hours=BUDGET_HOURS),
         granularity=instance["granularity"], references=[starts_of(frame) for _, frame in references],
         delay_weight=weight, time_limit=MILP_LIMIT_SECONDS,
     )
@@ -1157,7 +1207,7 @@ def milp_instance(instance: dict) -> list[dict]:
     for name, frame in references:
         measured[name] = {
             "measured_gco2e": float(frame["emissions_gco2e"].sum()),
-            "model_gco2e": float(frame["emissions_gco2e_average_model"].sum()),
+            "model_gco2e": planning_emissions(jobs, dict(zip(frame["job_id"], frame["start_time"])), signal),
             "delay_hours": float(frame["waiting_s"].sum() / 3600),
             "waiting_mean_s": float(frame["waiting_s"].mean()),
         }
@@ -1165,7 +1215,7 @@ def milp_instance(instance: dict) -> list[dict]:
         plan = account_schedule(replay(jobs, starts, instance["nodes"]), jobs, actual)
         measured["milp"] = {
             "measured_gco2e": sum(record.emissions_gco2e for record in plan.records),
-            "model_gco2e": sum(record.emissions_gco2e_average_model for record in plan.records),
+            "model_gco2e": planning_emissions(jobs, starts, signal),
             "delay_hours": sum(record.waiting_seconds for record in plan.records) / 3600,
             "waiting_mean_s": float(np.mean([record.waiting_seconds for record in plan.records])),
         }

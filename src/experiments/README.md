@@ -5,6 +5,55 @@ simulator, the job models and the carbon-intensity forecasts each have their own
 package and their own evaluation; what lives here is what only makes sense when
 they are combined.
 
+## Consolidated QoS–carbon experiments
+
+The final thesis entry point is `robustness.py`:
+
+```bash
+make robustness ARGS='--workers 2'
+make robustness-report  # aggregate CSVs only
+.venv/bin/python tests/check_experiments_robustness.py
+```
+
+The [robustness report](../../results/qos_carbon/robustness/README.md) covers four
+release windows (including a continuous-schedule control), 880/512/256 nodes,
+15/60/240-minute decision grids, terminal demand, five mechanism contrasts,
+paired tail QoS and short/long × small/large job classes. It exports final
+delay-budget figures and a five-configuration table in CSV, Markdown and LaTeX.
+Window and grid parameters belong to the experiment scenario and its cache key;
+the scheduler implementation is unchanged. The selected improved policy has
+neither congestion pricing nor delay scaling; those are explicit additions in
+the ablation, with congestion compared under a compatible carbon objective.
+
+`qos_carbon.py` provides the main information matrix. It reuses the frozen inputs,
+validation-selected benefit-rate policy and cached schedules from
+`improved_scheduler.py`; it completes the four information cells at all six
+delay budgets and separates runtime and power errors with a 2×2×2 control at
+6 h. No model or scheduler parameter is fitted on test.
+
+```bash
+make qos-carbon ARGS='--workers 2'
+make qos-carbon-report  # CSVs only; no simulations or original datasets needed
+.venv/bin/python tests/check_experiments_qos_carbon.py
+```
+
+The [generated report](../../results/qos_carbon/README.md), aggregate CSVs,
+PNG/PDF figures and SHA-256 protocol are in `results/qos_carbon/` and tracked.
+Per-job schedules remain in the existing cache; new MILP plans and solver
+metadata are in `data/experiments/qos_carbon/milp/`. Missing frozen inputs can
+be recreated with the `prepare` and `validation` phases below.
+
+The report explicitly distinguishes matched-runtime EASY savings from the
+fixed actual-runtime EASY reference used for benefit retention and loss
+attribution. Pareto flags are computed within a scenario; marginal cost is
+undefined when more delay saves no extra carbon. MILP objective gaps use
+`planning_emissions()` (the exact solver coefficients), not sampled ex-post
+average-power accounting. Solver bounds apply to the shared discrete domain;
+weighted objectives and measured emissions have separate columns.
+
+The sections below preserve earlier experiments on other cohorts/protocols;
+their historical numerical tables are not silently combined with this report.
+
 ## Information ablation
 
 `ablation.py` answers one question: of the carbon saving an oracle could take,
@@ -220,8 +269,8 @@ Delay price, 5,000 jobs on 880 nodes, 60-minute grid:
 - No rolling horizon. Splitting the trace into windows gives up the proof of
   optimality, which is the only reason this program exists, and the cost grows
   fast with contention: 5,000 jobs at 9.7% utilisation close in 17 s, 1,000 at
-  46.8% do not close in 600 s. Future work, together with an online greedy that
-  prices delay.
+  46.8% do not close in 600 s. Rolling-horizon MILP remains future work;
+  online delay objectives were subsequently implemented in the next section.
 
 ### Reproducing it
 
